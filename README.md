@@ -1,4 +1,4 @@
-# minimax-web-extension
+# Agentic Web Bridge for Browser Automation
 
 A local-first browser automation bridge. AI agents drive your real Chrome / Edge via the Chrome DevTools Protocol.
 
@@ -8,6 +8,25 @@ A local-first browser automation bridge. AI agents drive your real Chrome / Edge
 your agent  ──HTTP──▶  local Python server  ◀──CDP──  browser extension
    (CLI / Python / any tool)   (127.0.0.1:9876)         (your Chrome / Edge)
 ```
+
+> ## ⚠️ Disclaimer
+>
+> This software gives the operator full browser-automation capability, including on tabs where the user is already authenticated. **You are responsible for everything done through the bridge.**
+>
+> - Only run this on machines you control and trust.
+> - The bridge binds to `127.0.0.1` only — it is **not** reachable from your LAN or the internet.
+> - Any AI agent, script, or human that can talk to `http://127.0.0.1:9876` on your box can drive any tab you have the extension attached to. Don't expose that port.
+> - **Respect the terms of service of every site you automate.** Don't use this to scrape content behind a login wall, bypass paywalls, evade rate limits, or do anything that violates the target site's ToS or applicable law.
+> - The maintainers (Vex / the GitHub account holding the repo) provide this code **as-is, with no warranty**, under the MIT license. You bear all responsibility for how you use it.
+> - This project is not affiliated with, endorsed by, or sponsored by any AI vendor, browser vendor, or SaaS company. The name "Vex" refers to the AI build collaborator that authored the project.
+
+## Responsible use
+
+- Use this on your own browser, with your own accounts, for your own automation.
+- If a site's ToS forbids the kind of automation you want — don't do it.
+- Don't build spam, credential stuffing, CAPTCHA bypass, or anything that hurts other people.
+- If you find a security issue, please open a fork and reach out (see `SECURITY.md`).
+
 
 ## What it does
 
