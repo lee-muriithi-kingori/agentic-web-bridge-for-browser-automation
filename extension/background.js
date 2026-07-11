@@ -21,23 +21,84 @@ const attachedTabs = new Set();   // tabIds where we have a debugger session
 
 function log(...a) { console.log("[webbridge]", ...a); }
 
-async function cdp(tabId, method, params = {}) {
-  if (!attachedTabs.has(tabId)) {
-    try {
-      await chrome.debugger.attach({ tabId }, "1.3");
-      attachedTabs.add(tabId);
-      log("cdp attach tab=" + tabId);
-    } catch (e) {
-      throw new Error("debugger attach failed: " + (e.message || e));
-    }
+// ---------- anti-detect: random pre-action jitter ----------
+async function preActionJitter() { await sleep(jitter(120, 600)); }
+
+// ---------- anti-detect helpers ----------
+
+// Random delay helpers (humans are not metronomes).
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function jitter(min, max) { return min + Math.random() * (max - min); }
+async function humanDelay(min = 80, max = 350) { await sleep(jitter(min, max)); }
+
+// Move the mouse from (fromX,fromY) to (toX,toY) in a few mouseMoved events
+// so anti-bot heuristics see a real cursor trajectory, not a teleport.
+async function moveMouseHuman(tabId, fromX, fromY, toX, toY) {
+  const steps = Math.max(6, Math.round(jitter(8, 18)));
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    // ease-out curve
+    const ease = 1 - Math.pow(1 - t, 2);
+    const x = fromX + (toX - fromX) * ease + jitter(-1.5, 1.5);
+    const y = fromY + (toY - fromY) * ease + jitter(-1.5, 1.5);
+    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none" });
+    await sleep(jitter(6, 18));
   }
-  try {
-    return await chrome.debugger.sendCommand({ tabId }, method, params);
-  } catch (e) {
-    // The user might have rejected the debug bar, or another debugger
-    // took over. Drop the session and let the next call re-attach.
-    attachedTabs.delete(tabId);
-    throw e;
+}
+
+// Track the last mouse position so the next move has a real "from" coordinate.
+const lastMouse = new Map(); // tabId -> {x, y}
+function setLastMouse(tabId, x, y) { lastMouse.set(tabId, { x, y }); }
+function getLastMouse(tabId) {
+  return lastMouse.get(tabId) || { x: 100, y: 100 };
+}
+
+// Humanized click: hover trajectory, jitter, slight off-center, hover delay.
+async function clickHuman(tabId, where) {
+  const last = getLastMouse(tabId);
+  await moveMouseHuman(tabId, last.x, last.y, where.x, where.y);
+  await sleep(jitter(50, 200));
+  await cdp(tabId, "Input.dispatchMouseEvent", {
+    type: "mousePressed", x: where.x, y: where.y, button: "left", clickCount: 1
+  });
+  await sleep(jitter(20, 60));
+  await cdp(tabId, "Input.dispatchMouseEvent", {
+    type: "mouseReleased", x: where.x, y: where.y, button: "left", clickCount: 1
+  });
+  setLastMouse(tabId, where.x, where.y);
+}
+
+// Humanized type: per-char dispatchKeyEvent with variable WPM and occasional
+// pauses. Falls back to insertText only if the page doesn't accept the
+// char events.
+async function typeHuman(tabId, text) {
+  await cdp(tabId, "Input.dispatchKeyEvent", {
+    type: "keyDown", text: "", key: "", code: "", windowsVirtualKeyCode: 0
+  });
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const isNewline = ch === "\n";
+    await sleep(jitter(45, 180));
+    if (isNewline) {
+      await cdp(tabId, "Input.dispatchKeyEvent", {
+        type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13
+      });
+      await cdp(tabId, "Input.dispatchKeyEvent", {
+        type: "keyUp",   key: "Enter", code: "Enter", windowsVirtualKeyCode: 13
+      });
+      continue;
+    }
+    // dispatchKeyEvent with text: mimics a real keypress better than insertText
+    await cdp(tabId, "Input.dispatchKeyEvent", {
+      type: "keyDown", text: ch, unmodifiedText: ch, key: ch, code: "Key" + ch.toUpperCase(),
+      windowsVirtualKeyCode: ch.toUpperCase().charCodeAt(0)
+    });
+    await cdp(tabId, "Input.dispatchKeyEvent", {
+      type: "keyUp",   text: ch, unmodifiedText: ch, key: ch, code: "Key" + ch.toUpperCase(),
+      windowsVirtualKeyCode: ch.toUpperCase().charCodeAt(0)
+    });
+    // Occasional "thinking" pause every ~12 chars
+    if (i % 12 === 11) await sleep(jitter(300, 700));
   }
 }
 
@@ -131,18 +192,29 @@ async function cmdQuery(tabId, args) {
 async function cmdClick(tabId, args) {
   const sel = args && args.selector;
   if (!sel) throw new Error("click requires selector");
-  // Find the element's center via getBoxModel, then dispatch a real mouse
-  // press/release at that point.
+  const humanize = !!(args && args.humanize);
+  // Find the element's center via getBoundingClientRect. Slight random
+  // offset (only when humanizing) so two consecutive clicks don't land
+  // on the exact same pixel — real humans don't pixel-perfect-center.
   const expr =
     "(()=>{const e=document.querySelector(" + JSON.stringify(sel) + ");" +
     "if(!e)throw new Error('no match for '+" + JSON.stringify(sel) + ");" +
-    "e.scrollIntoView({block:'center'});" +
+    "e.scrollIntoView({block:'center',behavior:'instant'});" +
     "const r=e.getBoundingClientRect();" +
     "return {x:r.left+r.width/2,y:r.top+r.height/2,tag:e.tagName,text:(e.innerText||'').slice(0,80)};})()";
   const where = await evald(tabId, expr);
-  await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: where.x, y: where.y, button: "left", clickCount: 1 });
-  await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: where.x, y: where.y, button: "left", clickCount: 1 });
-  return { clicked: where.tag, at: { x: where.x, y: where.y }, text: where.text };
+  const jitter = humanize ? 6 : 0;
+  const cx = where.x + (Math.random() * 2 - 1) * jitter;
+  const cy = where.y + (Math.random() * 2 - 1) * jitter;
+
+  if (humanize) {
+    await clickHuman(tabId, { x: cx, y: cy });
+  } else {
+    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1 });
+    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1 });
+    setLastMouse(tabId, cx, cy);
+  }
+  return { clicked: where.tag, at: { x: cx, y: cy }, text: where.text, humanize };
 }
 
 async function cmdType(tabId, args) {
@@ -150,11 +222,17 @@ async function cmdType(tabId, args) {
   const text = args && args.text;
   if (!sel) throw new Error("type requires selector");
   if (text == null) throw new Error("type requires text");
-  // Focus the field by clicking it, then type.
-  await cmdClick(tabId, { selector: sel });
-  // InsertText is the right way — bypasses keyboard layout issues.
-  await cdp(tabId, "Input.insertText", { text: String(text) });
-  return { typed: String(text).length, into: sel };
+  const humanize = !!(args && args.humanize);
+  // Focus the field by clicking it (humanized if requested).
+  await cmdClick(tabId, { selector: sel, humanize });
+  if (humanize) {
+    await typeHuman(tabId, String(text));
+  } else {
+    // Fast path: insertText is one call, instant. Use for non-detect
+    // flows (CI, scraping, batch ops).
+    await cdp(tabId, "Input.insertText", { text: String(text) });
+  }
+  return { typed: String(text).length, into: sel, humanize };
 }
 
 async function cmdScreenshot(tabId) {
@@ -173,13 +251,15 @@ async function cmdScreenshot(tabId) {
 
 async function cmdKey(tabId, args) {
   if (!args || !args.key) throw new Error("key requires key");
-  // args.key is e.g. "Enter", "Tab", "Escape", "ArrowDown", or a printable char
-  // CDP expects windowsVirtualKeyCode for some events and text for others.
-  // We use the high-level dispatchKeyEvent with text.
   const k = String(args.key);
+  const humanize = !!(args && args.humanize);
+  if (humanize) {
+    await sleep(jitter(60, 220));
+  }
   await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", text: k, unmodifiedText: k, key: k, code: k, windowsVirtualKeyCode: k.charCodeAt(0) || 0 });
+  if (humanize) await sleep(jitter(15, 50));
   await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", text: k, unmodifiedText: k, key: k, code: k, windowsVirtualKeyCode: k.charCodeAt(0) || 0 });
-  return { pressed: k };
+  return { pressed: k, humanize };
 }
 
 const COMMANDS = {
