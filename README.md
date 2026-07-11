@@ -2,7 +2,7 @@
 
 A local-first browser automation bridge. AI agents drive your real Chrome / Edge via the Chrome DevTools Protocol.
 
-Like [Kimi WebBridge](https://kimi.com/features/webbridge), but **agent-agnostic and 100 % local** — your logins, your data, your machine. No cloud relay, no Moonshot, no token burned.
+**Built by Vex** — your AI build collaborator. Agent-agnostic, 100 % local, your logins stay yours. No cloud relay, no third-party tokens, no SaaS lock-in. You drive your own browser, with your own sessions, on your own machine.
 
 ```
 your agent  ──HTTP──▶  local Python server  ◀──CDP──  browser extension
@@ -136,7 +136,7 @@ The background service worker will auto-attach `chrome.debugger` to the chosen t
 
 `chrome.scripting.executeScript` runs in the page's main world, so it is subject to the page's Content Security Policy. A lot of modern sites (`script-src 'self' 'wasm-unsafe-eval' …`) reject `'unsafe-eval'`, which breaks `new Function(...)`-based eval.
 
-`chrome.debugger` + `Runtime.evaluate` runs in the browser's debug world, which is **outside the page's CSP**. That's how Kimi WebBridge works, how Chrome DevTools works, and how you can still drive pages that block injected scripts.
+`chrome.debugger` + `Runtime.evaluate` runs in the browser's debug world, which is **outside the page's CSP**. That's how Chrome DevTools itself drives pages, and how you can still drive pages that block injected scripts.
 
 The trade-off: the user sees a yellow "being debugged" bar on attached tabs. For agent use that's a fair price.
 
