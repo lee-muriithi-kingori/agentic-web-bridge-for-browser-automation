@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>WebBridge</title>
+    <style>
+      body { font: 13px/1.4 -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 12px 14px; width: 240px; color: #1a1a1a; }
+      h1 { font-size: 14px; margin: 0 0 6px; }
+      .row { margin: 4px 0; }
+      .lbl { color: #888; }
+      .val { word-break: break-all; }
+      .ok { color: #0a7e1a; }
+      .err { color: #b00020; }
+      button { font: inherit; padding: 4px 10px; margin-top: 6px; cursor: pointer; }
+      .url { font-size: 11px; color: #444; max-height: 4em; overflow: hidden; }
+    </style>
+  </head>
+  <body>
+    <h1>WebBridge</h1>
+    <div class="row"><span class="lbl">Server:</span> <span id="srv" class="val">…</span></div>
+    <div class="row"><span class="lbl">URL:</span> <span id="url" class="val url">…</span></div>
+    <div class="row"><span class="lbl">Title:</span> <span id="title" class="val">…</span></div>
+    <div class="row"><span class="lbl">Ext ID:</span> <span id="ext" class="val">…</span></div>
+    <button id="ping">Ping</button>
+    <script src="popup.js"></script>
+  </body>
+</html>
