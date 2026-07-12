@@ -1,4 +1,4 @@
-// WebBridge background service worker (v4) — uses chrome.debugger (CDP).
+// WebBridge background service worker (v5) — uses chrome.debugger (CDP).
 // Architecture mirrors Kimi WebBridge: the extension attaches to tabs
 // via the chrome.debugger API, then sends Chrome DevTools Protocol
 // commands. CDP runs at the browser layer, so it:
@@ -176,7 +176,35 @@ async function cmdEval(tabId, args) {
 
 async function cmdTitle(tabId) { return evald(tabId, "document.title"); }
 async function cmdUrl(tabId)   { return evald(tabId, "location.href"); }
-async function cmdHtml(tabId)  { return evald(tabId, "document.documentElement.outerHTML"); }
+async function cmdHtml(tabId, args) {
+  // v5: opt-in safe mode strips <script>/<style>/<noscript>/<iframe> and
+  // inline on* handlers + javascript: URLs from the returned HTML. This
+  // is a light sanitizer, NOT a substitute for DOMPurify when ingesting
+  // untrusted HTML — but it stops the common cases (script execution,
+  // clickjacking helpers, link-based XSS) without a 100KB dependency.
+  const safe = !!(args && args.safe);
+  const sel = (args && args.selector) || "document.documentElement";
+  const expr = "(()=>{\n" +
+    "  const root = " + sel + ";\n" +
+    "  if (!root) return '';\n" +
+    "  let html = root.outerHTML;\n" +
+    (safe ?
+    "  if (typeof DOMParser === 'undefined') return html;\n" +
+    "  const doc = new DOMParser().parseFromString('<!doctype html><body>' + html + '</body>', 'text/html');\n" +
+    "  doc.querySelectorAll('script,style,noscript,iframe,object,embed').forEach(n => n.remove());\n" +
+    "  doc.querySelectorAll('*').forEach(n => {\n" +
+    "    for (const a of Array.from(n.attributes)) {\n" +
+    "      const n2 = a.name.toLowerCase();\n" +
+    "      if (n2.startsWith('on')) n.removeAttribute(a.name);\n" +
+    "      if ((n2 === 'href' || n2 === 'src' || n2 === 'xlink:href') && /^\\s*javascript:/i.test(a.value)) n.removeAttribute(a.name);\n" +
+    "    }\n" +
+    "  });\n" +
+    "  html = doc.body.innerHTML;\n"
+    : "") +
+    "  return html;\n" +
+    "})()";
+  return evald(tabId, expr);
+}
 
 async function cmdSnippet(tabId) {
   return evald(tabId,
@@ -194,9 +222,188 @@ async function cmdQuery(tabId, args) {
   return evald(tabId, expr);
 }
 
+// see: vision loop with Set-of-Marks overlay (WebVoyager / BrowserControl /
+// Manus pattern). Returns:
+//   - image: a downsized JPEG/PNG screenshot with red numbered boxes
+//     drawn over every interactive element (anchor, button, input,
+//     textarea, select, contenteditable, [role=button|link|menuitem|...])
+//   - som:   array of {id, tag, role, text, selector, x, y, w, h} — one
+//     per numbered box. The agent can say "click element 5" and the
+//     bridge translates that to a real click on the actual element.
+//   - a11y:  optional accessibility tree (text-only, depth-limited)
+//   - cursor/focus/viewport: same as perceive
+// Overlays are added as DOM elements, the screenshot is captured with
+// them in place, then the overlays are removed — no permanent change
+// to the page.
+async function cmdSee(tabId, args) {
+  const maxWidth = Math.max(200, Math.min(2000, args && args.maxWidth || 800));
+  const quality = Math.max(10, Math.min(100, args && args.quality || 70));
+  const format = (args && args.format) || "jpeg";
+  const maxDepth = (args && args.maxDepth) || 4;
+  const maxLen = (args && args.maxLen) || 80;
+  const includeTree = !(args && args.tree === false);
+  const includeSom = !(args && args.som === false);
+
+  // Build the SoM map by walking interactive elements
+  const somMap = includeSom ? await evald(tabId, "(function(){\n" +
+    "  const sel = 'a, button, input, textarea, select, [role=button], [role=link], [role=menuitem], [role=tab], [role=checkbox], [role=radio], [contenteditable=true]';\n" +
+    "  const all = Array.from(document.querySelectorAll(sel));\n" +
+    "  const out = [];\n" +
+    "  for (const el of all) {\n" +
+    "    const r = el.getBoundingClientRect();\n" +
+    "    if (r.width === 0 || r.height === 0) continue;\n" +
+    "    if (r.bottom < 0 || r.top > window.innerHeight) continue;\n" +
+    "    if (r.right < 0 || r.left > window.innerWidth) continue;\n" +
+    "    const cs = getComputedStyle(el);\n" +
+    "    if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') continue;\n" +
+    "    let selector = '';\n" +
+    "    if (el.id) selector = '#' + CSS.escape(el.id);\n" +
+    "    else if (el.name) selector = el.tagName.toLowerCase() + '[name=\"' + el.name + '\"]';\n" +
+    "    else {\n" +
+    "      const path = [];\n" +
+    "      let cur = el;\n" +
+    "      while (cur && cur !== document.body && path.length < 4) {\n" +
+    "        let part = cur.tagName.toLowerCase();\n" +
+    "        if (cur.id) { part = '#' + CSS.escape(cur.id); path.unshift(part); break; }\n" +
+    "        if (cur.className && typeof cur.className === 'string') {\n" +
+    "          const cls = cur.className.trim().split(/\\s+/).slice(0, 1).map(c => '.' + CSS.escape(c)).join('');\n" +
+    "          if (cls) part += cls;\n" +
+    "        }\n" +
+    "        const sibs = cur.parentElement ? Array.from(cur.parentElement.children).filter(c => c.tagName === cur.tagName) : [];\n" +
+    "        if (sibs.length > 1) part += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';\n" +
+    "        path.unshift(part);\n" +
+    "        cur = cur.parentElement;\n" +
+    "      }\n" +
+    "      selector = path.join(' > ');\n" +
+    "    }\n" +
+    "    const id = out.length + 1;\n" +
+    "    el.setAttribute('data-webbridge-som-id', String(id));\n" +
+    "    out.push({ id, tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '',\n" +
+    "      text: (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').trim().slice(0, 80),\n" +
+    "      selector, x: r.left + r.width/2, y: r.top + r.height/2, w: r.width, h: r.height });\n" +
+    "  }\n" +
+    "  return out;\n" +
+    "})()") : [];
+
+  // Inject overlay divs over each element, then re-screenshot
+  let image = null;
+  if (Array.isArray(somMap) && somMap.length > 0) {
+    // Inject overlay
+    await evald(tabId, "(function(boxes){\n" +
+      "  const prior = document.getElementById('__webbridge_som_overlay__');\n" +
+      "  if (prior) prior.remove();\n" +
+      "  const wrap = document.createElement('div');\n" +
+      "  wrap.id = '__webbridge_som_overlay__';\n" +
+      "  wrap.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483647;';\n" +
+      "  for (const b of boxes) {\n" +
+      "    const r = document.createElement('div');\n" +
+      "    r.style.cssText = 'position:absolute;left:' + (b.x - b.w/2) + 'px;top:' + (b.y - b.h/2) + 'px;width:' + b.w + 'px;height:' + b.h + 'px;border:2px solid #ff2d2d;box-sizing:border-box;background:rgba(255,45,45,0.08);';\n" +
+      "    const tag = document.createElement('div');\n" +
+      "    tag.style.cssText = 'position:absolute;left:-2px;top:-22px;background:#ff2d2d;color:#fff;font:bold 12px monospace;padding:1px 5px;border-radius:2px;white-space:nowrap;';\n" +
+      "    tag.textContent = '[' + b.id + ']';\n" +
+      "    r.appendChild(tag);\n" +
+      "    wrap.appendChild(r);\n" +
+      "  }\n" +
+      "  document.body.appendChild(wrap);\n" +
+      "  return true;\n" +
+    "})(" + JSON.stringify(somMap) + ")");
+    // Capture with overlay in place
+    const cap = await cdp(tabId, "Page.captureScreenshot", { format });
+    // Return the raw base64 (downsizing via canvas-in-page would require
+    // sending a 200-500KB base64 string through Runtime.evaluate, which
+    // is slow and hits the CDP message-size limit on some pages).
+    image = { dataUrl: "data:image/" + format + ";base64," + cap.data, width: 0, height: 0, bytes: cap.data.length, raw: true };
+    // Clean up overlay
+    await evald(tabId, "(()=>{const o=document.getElementById('__webbridge_som_overlay__');if(o)o.remove();return true;})()");
+  } else {
+    // No SoM elements found; just take a clean screenshot
+    const cap = await cdp(tabId, "Page.captureScreenshot", { format });
+    image = { dataUrl: "data:image/" + format + ";base64," + cap.data, width: 0, height: 0, bytes: cap.data.length, raw: true };
+  }
+
+  // Cursor / focus / viewport
+  const last = await evald(tabId, "(window.__webbridgeLastMouse || { x: 0, y: 0 })");
+  let underEl = null;
+  try {
+    underEl = await evald(tabId, "(function(x, y, ml){\n" +
+      "  const e = document.elementFromPoint(x, y);\n" +
+      "  if (!e) return null;\n" +
+      "  const r = e.getBoundingClientRect();\n" +
+      "  return { tag: e.tagName, id: e.id || null, cls: (typeof e.className === 'string' ? e.className : '').slice(0, 60),\n" +
+      "    text: (e.innerText || e.value || '').trim().slice(0, ml),\n" +
+      "    somId: e.getAttribute('data-webbridge-som-id') || null,\n" +
+      "    x: r.left + r.width/2, y: r.top + r.height/2 };\n" +
+      "})(" + last.x + ", " + last.y + ", " + maxLen + ")");
+  } catch (_) {}
+
+  const focus = await evald(tabId, "(function(ml){\n" +
+    "  const a = document.activeElement;\n" +
+    "  if (!a || a === document.body) return null;\n" +
+    "  return { tag: a.tagName, id: a.id || null, role: a.getAttribute('role') || null,\n" +
+    "    value: a.value !== undefined ? String(a.value) : null,\n" +
+    "    placeholder: a.placeholder || null,\n" +
+    "    somId: a.getAttribute('data-webbridge-som-id') || null,\n" +
+    "    text: (a.innerText || '').trim().slice(0, ml) };\n" +
+    "})(" + maxLen + ")");
+  const vp = await evald(tabId, "({ w: window.innerWidth, h: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY, docH: document.documentElement.scrollHeight })");
+
+  // a11y tree (optional)
+  let tree = null;
+  if (includeTree) {
+    tree = await evald(tabId, "(function(md, ml){\n" +
+      "  function w(el, d) {\n" +
+      "    if (!el || d > md) return '';\n" +
+      "    const tag = (el.tagName || '').toLowerCase();\n" +
+      "    if (['script','style','noscript','svg','path','head','meta','link'].includes(tag)) return '';\n" +
+      "    if (el.offsetWidth === 0 && el.offsetHeight === 0 && d > 0) return '';\n" +
+      "    const role = el.getAttribute('role') || (['a','button','input','textarea','select'].includes(tag) ? tag : '');\n" +
+      "    const aria = el.getAttribute('aria-label') || '';\n" +
+      "    const ph = el.getAttribute('placeholder') || '';\n" +
+      "    const somId = el.getAttribute('data-webbridge-som-id') || '';\n" +
+      "    const text = (el.innerText || '').trim().slice(0, ml);\n" +
+      "    let out = '  '.repeat(d) + '<' + tag;\n" +
+      "    if (role) out += ' role=' + role;\n" +
+      "    if (aria) out += ' aria=\"' + aria + '\"';\n" +
+      "    if (ph) out += ' ph=\"' + ph + '\"';\n" +
+      "    if (somId) out += ' som=' + somId;\n" +
+      "    out += '>' + (text ? ' ' + text : '') + '\\n';\n" +
+      "    for (const c of el.children) out += w(c, d + 1);\n" +
+      "    return out;\n" +
+      "  }\n" +
+      "  return w(document.body, 0);\n" +
+    "})(" + maxDepth + ", " + maxLen + ")");
+  }
+
+  return {
+    url: await evald(tabId, "location.href"),
+    title: await evald(tabId, "document.title"),
+    cursor: { x: last.x, y: last.y, under: underEl },
+    focus: focus,
+    viewport: vp,
+    image: image,
+    som: Array.isArray(somMap) ? somMap : null,
+    a11y: tree,
+  };
+}
+
 async function cmdClick(tabId, args) {
+  // If elementId given, translate to a real click via the SoM marker
+  if (args && (typeof args.elementId === "number" || (typeof args.elementId === "string" && /^\d+$/.test(args.elementId)))) {
+    const eid = Number(args.elementId);
+    const r = await evald(tabId, "(function(id){\n" +
+      "  const e = document.querySelector('[data-webbridge-som-id=\"' + id + '\"]');\n" +
+      "  if (!e) return null;\n" +
+      "  e.scrollIntoView({block: 'center', behavior: 'instant'});\n" +
+      "  const r = e.getBoundingClientRect();\n" +
+      "  return { tag: e.tagName, text: (e.innerText || e.value || '').trim().slice(0, 80),\n" +
+      "    x: r.left + r.width/2, y: r.top + r.height/2 };\n" +
+      "})(" + eid + ")");
+    if (!r) throw new Error("no element with SoM id " + eid);
+    args = Object.assign({}, args, { x: r.x, y: r.y });
+    delete args.elementId;
+  }
   const sel = args && args.selector;
-  if (!sel) throw new Error("click requires selector");
+  if (!sel && (typeof args.x !== "number" || typeof args.y !== "number")) throw new Error("click requires selector, {x,y}, or {elementId}");
   const humanize = !!(args && args.humanize);
   // Find the element's center via getBoundingClientRect. Slight random
   // offset (only when humanizing) so two consecutive clicks don't land
@@ -208,6 +415,18 @@ async function cmdClick(tabId, args) {
     "const r=e.getBoundingClientRect();" +
     "return {x:r.left+r.width/2,y:r.top+r.height/2,tag:e.tagName,text:(e.innerText||'').slice(0,80)};})()";
   const where = await evald(tabId, expr);
+  // v5: actionability check (opt-in via args.actionable = true). Catches
+  // hidden / occluded / out-of-viewport elements BEFORE we click, so the
+  // agent gets a clean reason instead of a "clicked but nothing happened"
+  // mystery. Skipped when args.actionable is unset/false to preserve
+  // existing behavior.
+  if (args && args.actionable) {
+    const a = await checkActionable(tabId, sel);
+    if (!a || !a.ok) {
+      const reason = (a && a.reason) || "not-actionable";
+      throw new Error("not actionable (" + reason + ") selector=" + (sel || JSON.stringify({x:args.x,y:args.y})));
+    }
+  }
   const jitter = humanize ? 6 : 0;
   const cx = where.x + (Math.random() * 2 - 1) * jitter;
   const cy = where.y + (Math.random() * 2 - 1) * jitter;
@@ -267,6 +486,409 @@ async function cmdKey(tabId, args) {
   return { pressed: k, humanize };
 }
 
+// ---------- v5: accessibility-tree (CDP Accessibility domain) ----------
+//
+// axtree / axquery use the real Chromium accessibility tree (not the
+// page DOM). This is the same tree that screen readers and Playwright's
+// ARIA snapshot see, so it works for elements that exist only in the
+// shadow DOM, in iframes (when scoped), and as accessibility-only nodes
+// (e.g. <div role="button">). It's the right way to ask "what can the
+// user actually interact with?" instead of guessing from CSS selectors.
+//
+// Node shape returned by both methods:
+//   { nodeId, ignored, role: {value}, name: {value}, description: {value},
+//     value: {value}, properties: [...], childIds: [...],
+//     parentId, backendDOMNodeId }
+
+// Flatten CDP a11y nodes into a list of agent-friendly rows. We strip
+// the {value} wrappers and ignore generic grouping nodes (like "generic"
+// or "none" roles) when interestingOnly is set.
+function flattenAxNodes(nodes, interestingOnly) {
+  if (!Array.isArray(nodes)) return [];
+  const out = [];
+  for (const n of nodes) {
+    const role = (n.role && n.role.value) || "";
+    const name = (n.name && n.name.value) || "";
+    if (interestingOnly) {
+      // Mirror Chromium's "interesting" heuristic: skip role=generic / none
+      // and nodes with no name and no value (pure structural noise).
+      const interestingRoles = new Set([
+        "button","link","textbox","searchbox","combobox","checkbox","radio",
+        "switch","slider","spinbutton","menuitem","menuitemcheckbox","menuitemradio",
+        "tab","tabpanel","treeitem","option","progressbar","meter",
+        "alert","alertdialog","dialog","tooltip","heading","listitem",
+        "row","columnheader","rowheader","cell","grid","table","img",
+        "navigation","main","banner","contentinfo","form","region","article",
+        "list","listbox","menu","menubar","radiogroup","tablist","toolbar",
+        "tree","treegrid","status","timer","marquee","log",
+      ]);
+      if (!interestingRoles.has(role) && !name) continue;
+    }
+    const props = {};
+    if (Array.isArray(n.properties)) {
+      for (const p of n.properties) {
+        if (!p || !p.name) continue;
+        const v = p.value;
+        if (v && typeof v === "object" && "value" in v) props[p.name] = v.value;
+        else props[p.name] = v;
+      }
+    }
+    out.push({
+      nodeId: n.nodeId,
+      parentId: n.parentId || null,
+      ignored: !!n.ignored,
+      role,
+      name,
+      description: (n.description && n.description.value) || "",
+      value: (n.value && n.value.value) || "",
+      backendDOMNodeId: n.backendDOMNodeId || null,
+      properties: props,
+    });
+  }
+  return out;
+}
+
+async function cmdAxtree(tabId, args) {
+  // Accessibility.getFullAXTree — full a11y tree of the document.
+  // Use Accessibility.enable first; it's required for the domain.
+  await cdp(tabId, "Accessibility.enable").catch(() => {});
+  const r = await cdp(tabId, "Accessibility.getFullAXTree");
+  const interestingOnly = !!(args && args.interestingOnly);
+  const maxRows = Math.max(1, Math.min(5000, (args && args.maxRows) || 1500));
+  const rows = flattenAxNodes(r && r.nodes, interestingOnly).slice(0, maxRows);
+  return {
+    url: await evald(tabId, "location.href"),
+    title: await evald(tabId, "document.title"),
+    interestingOnly,
+    count: rows.length,
+    nodes: rows,
+  };
+}
+
+async function cmdAxquery(tabId, args) {
+  // axquery: focused a11y filter, like a "semantic querySelector".
+  // Calls Accessibility.getFullAXTree once, then filters client-side by
+  // role / name / descendantOf / backendDOMNodeId. We don't use
+  // Accessibility.queryAXTree because its nodeId is fussy (requires
+  // either the AXNodeId from a prior getFullAXTree call OR objectId
+  // from Runtime — and the id space is browser-version-dependent).
+  // Client-side filtering is faster, easier to debug, and gives the
+  // same result.
+  if (!args || (!args.role && !args.name && !args.descendantOf && !args.backendNodeId))
+    throw new Error("axquery requires at least one of: role, name, descendantOf, backendNodeId");
+  await cdp(tabId, "Accessibility.enable").catch(() => {});
+  const r = await cdp(tabId, "Accessibility.getFullAXTree");
+  const maxRows = Math.max(1, Math.min(2000, (args && args.maxRows) || 200));
+  const wantRole = args.role ? String(args.role).toLowerCase() : null;
+  const wantName = args.name ? String(args.name).toLowerCase() : null;
+  const wantNameExact = !!args.nameExact;
+  // Build parent map for descendantOf filter
+  const parentOf = new Map();
+  for (const n of (r && r.nodes) || []) {
+    if (n.parentId) parentOf.set(String(n.nodeId), String(n.parentId));
+  }
+  function isDescendantOf(nodeId, targetId) {
+    let cur = parentOf.get(String(nodeId));
+    while (cur) {
+      if (cur === String(targetId)) return true;
+      cur = parentOf.get(cur);
+    }
+    return false;
+  }
+  // First pass: flatten
+  const flat = flattenAxNodes(r && r.nodes, true);
+  // Second pass: filter
+  const matched = [];
+  for (const n of flat) {
+    if (wantRole && (n.role || "").toLowerCase() !== wantRole) continue;
+    if (wantName) {
+      const nm = (n.name || "").toLowerCase();
+      if (wantNameExact ? nm !== wantName : !nm.includes(wantName)) continue;
+    }
+    if (args.descendantOf != null) {
+      if (!isDescendantOf(n.nodeId, args.descendantOf)) continue;
+    }
+    if (args.backendNodeId != null) {
+      if (Number(n.backendDOMNodeId) !== Number(args.backendNodeId)) continue;
+    }
+    matched.push(n);
+    if (matched.length >= maxRows) break;
+  }
+  return { count: matched.length, nodes: matched };
+}
+
+// ---------- v5: web-first expect (auto-retry assertion) ----------
+//
+// expect polls a JS expression in the page until it returns truthy
+// (or non-null when asNotNull is set), with a soft timeout. Returns
+// the final value, attempt count, and elapsed ms. Use it instead of
+// racy "sleep then check" loops. Per the knowledge base: this is the
+// Playwright `expect().toBeVisible()` pattern, implemented as a
+// single CDP call.
+async function cmdExpect(tabId, args) {
+  if (!args || !args.code) throw new Error("expect requires code");
+  const timeoutMs = Math.max(100, Math.min(60000, args.timeoutMs || 10000));
+  const intervalMs = Math.max(50, Math.min(2000, args.intervalMs || 250));
+  const asNotNull = !!args.asNotNull;
+  const negate = !!args.negate;            // wait for the expression to be FALSY
+  const start = Date.now();
+  let attempts = 0;
+  let lastValue = undefined;
+  let lastError = null;
+  while (Date.now() - start < timeoutMs) {
+    attempts++;
+    try {
+      const v = await evald(tabId, String(args.code), true, false);
+      lastValue = v;
+      const truthy = asNotNull ? (v != null) : !!v;
+      const ok = negate ? !truthy : truthy;
+      if (ok) {
+        return { ok: true, attempts, elapsedMs: Date.now() - start, value: v };
+      }
+    } catch (e) {
+      lastError = String(e && e.message || e);
+    }
+    await sleep(intervalMs);
+  }
+  return {
+    ok: false,
+    attempts,
+    elapsedMs: Date.now() - start,
+    value: lastValue,
+    lastError,
+    timeoutMs,
+    hint: "expression never became " + (negate ? "falsy" : (asNotNull ? "non-null" : "truthy")),
+  };
+}
+
+// ---------- v5: human-like scroll ----------
+//
+// Real users don't teleport-scroll. They do a few small wheel events
+// (50-150px each), pause to read, then maybe another burst. This
+// command mimics that pattern: dispatches N small mouseWheel events
+// separated by jittered pauses, with a long pause after the burst.
+//
+// Modes:
+//   - { y: -400 }             scroll up 400px (small delta) in human bursts
+//   - { y: 1000 }             scroll down 1000px in human bursts
+//   - { to: 1500 }            scroll to absolute Y position (smooth-ish)
+//   - { bottom: true }        scroll to the bottom of the document
+//   - { selector: "h2.reviews" } scroll element into view (uses scrollIntoView)
+async function cmdScroll(tabId, args) {
+  args = args || {};
+  await ensureAttached(tabId);
+  if (args.selector) {
+    return evald(tabId, "(function(sel){" +
+      "const e=document.querySelector(sel);" +
+      "if(!e)return{ok:false,reason:'not-found'};" +
+      "e.scrollIntoView({block:'center',behavior:'smooth'});" +
+      "return{ok:true,scrolledTo:sel,y:window.scrollY};})(" + JSON.stringify(args.selector) + ")");
+  }
+  if (args.bottom) {
+    await evald(tabId, "window.scrollTo({top:document.documentElement.scrollHeight,behavior:'smooth'})");
+    return { scrolledTo: "bottom", finalY: await evald(tabId, "window.scrollY") };
+  }
+  if (args.top) {
+    await evald(tabId, "window.scrollTo({top:0,behavior:'smooth'})");
+    return { scrolledTo: "top", finalY: await evald(tabId, "window.scrollY") };
+  }
+  let targetY = null;
+  let delta = 0;
+  if (typeof args.to === "number") {
+    const cur = await evald(tabId, "window.scrollY");
+    targetY = args.to;
+    delta = targetY - (cur || 0);
+  } else if (typeof args.y === "number") {
+    delta = args.y;
+  } else {
+    throw new Error("scroll requires {y}, {to}, {bottom}, {top}, or {selector}");
+  }
+  // Dispatch the scroll in small human-like bursts.
+  // Each burst: 3-7 small wheel events of 40-110px each, then a 200-700ms pause.
+  // Total delta: ~delta
+  const direction = delta >= 0 ? 1 : -1;
+  const absTotal = Math.abs(delta);
+  const burstCount = Math.max(1, Math.ceil(absTotal / 400)); // a burst per ~400px
+  let remaining = absTotal;
+  let totalWaited = 0;
+  const perBurstPauses = [];
+  for (let b = 0; b < burstCount && remaining > 0; b++) {
+    const burstSize = Math.min(remaining, 200 + Math.random() * 250); // 200-450 per burst
+    const wheelCount = 3 + Math.floor(Math.random() * 4); // 3-6 events
+    const perWheel = burstSize / wheelCount;
+    for (let w = 0; w < wheelCount; w++) {
+      const d = perWheel * direction;
+      // Get viewport dims from the page (not the SW's global `window`)
+      const dims = await evald(tabId, "({w:window.innerWidth,h:window.innerHeight})");
+      await cdp(tabId, "Input.dispatchMouseEvent", {
+        type: "mouseWheel",
+        x: Math.floor((dims && dims.w) / 2) || 640,
+        y: Math.floor((dims && dims.h) / 2) || 400,
+        deltaX: 0,
+        deltaY: d,
+        wheelDeltaX: 0,
+        wheelDeltaY: d,
+        modifiers: 0,
+        pointerType: "mouse",
+        bubbles: true,
+        cancelable: true,
+      });
+      await sleep(jitter(20, 60));
+      remaining -= perWheel;
+    }
+    const pause = jitter(180, 600);
+    perBurstPauses.push(Math.round(pause));
+    await sleep(pause);
+    totalWaited += pause;
+  }
+  // Ensure we actually moved (some pages have their own scroll handlers)
+  const finalY = await evald(tabId, "window.scrollY");
+  return {
+    requestedDelta: delta,
+    burstCount,
+    pauses: perBurstPauses,
+    finalY,
+    finalDocH: await evald(tabId, "document.documentElement.scrollHeight"),
+  };
+}
+//
+// Computer Use / desktop automation tools think in coordinates and
+// move. The bridge has had implicit moves inside click/type, but
+// agents sometimes want to say "hover at (x,y) for 2s and report
+// what shows up under the cursor." This is the bridge command for that.
+async function cmdMove(tabId, args) {
+  if (!args || typeof args.x !== "number" || typeof args.y !== "number")
+    throw new Error("move requires {x, y}");
+  const humanize = args.humanize !== false; // default ON
+  if (humanize) {
+    const last = getLastMouse(tabId);
+    await moveMouseHuman(tabId, last.x, last.y, args.x, args.y);
+  } else {
+    await cdp(tabId, "Input.dispatchMouseEvent", {
+      type: "mouseMoved", x: args.x, y: args.y, button: "none",
+    });
+  }
+  setLastMouse(tabId, args.x, args.y);
+  return { x: args.x, y: args.y, humanize };
+}
+
+// ---------- v5: actionability check ----------
+//
+// Before clicking, optionally verify the target is actually clickable:
+//   - has a non-zero bounding box
+//   - not display:none / visibility:hidden / opacity:0
+//   - inside the viewport (with optional tolerance)
+//   - elementFromPoint at the center matches the target (or is a
+//     descendant of it) — catches overlap by sticky headers, modals,
+//     dev-tool overlays, etc.
+// Returns { ok, reason? }. Used by cmdClick when args.actionable = true.
+async function checkActionable(tabId, selector) {
+  if (!selector) return { ok: true, reason: "no-selector-skipped" };
+  const expr =
+    "(()=>{const e=document.querySelector(" + JSON.stringify(selector) + ");" +
+    "if(!e)return{ok:false,reason:'not-found',tag:null};" +
+    "const r=e.getBoundingClientRect();" +
+    "if(r.width===0||r.height===0)return{ok:false,reason:'zero-size',rect:r};" +
+    "const cs=getComputedStyle(e);" +
+    "if(cs.display==='none')return{ok:false,reason:'display-none',tag:e.tagName};" +
+    "if(cs.visibility==='hidden')return{ok:false,reason:'visibility-hidden',tag:e.tagName};" +
+    "if(parseFloat(cs.opacity||'1')===0)return{ok:false,reason:'opacity-0',tag:e.tagName};" +
+    "if(cs.pointerEvents==='none')return{ok:false,reason:'pointer-events-none',tag:e.tagName};" +
+    "if(r.bottom<0||r.right<0||r.top>innerHeight||r.left>innerWidth)" +
+    "  return{ok:false,reason:'out-of-viewport',rect:r,vp:{w:innerWidth,h:innerHeight}};" +
+    "const cx=r.left+r.width/2,cy=r.top+r.height/2;" +
+    "const top=document.elementFromPoint(cx,cy);" +
+    "if(!top||top===document.body||top===document.documentElement)" +
+    "  return{ok:false,reason:'covered-by-body',tag:e.tagName,topTag:top&&top.tagName};" +
+    "if(top!==e&&!e.contains(top))" +
+    "  return{ok:false,reason:'occluded',tag:e.tagName,topTag:top.tagName,topId:top.id||null};" +
+    "return{ok:true,tag:e.tagName,rect:r,center:{x:cx,y:cy}};})()";
+  return evald(tabId, expr);
+}
+
+// ---------- v5: trace bundle (auto-save for offline debugging) ----------
+//
+// When something goes wrong, save a self-contained bundle to disk:
+//   - screenshot (full viewport PNG)
+//   - URL + title + viewport + active element summary
+//   - focused a11y tree (interesting nodes only)
+//   - the last 20 console messages captured via Runtime.consoleAPICalled
+// Saves to the path returned by the server's /trace endpoint. The agent
+// can then attach the trace to a bug report or replay steps.
+const consoleBuffer = new Map(); // tabId -> [{type, text, ts}, ...]
+function recordConsole(tabId, type, text) {
+  if (!consoleBuffer.has(tabId)) consoleBuffer.set(tabId, []);
+  const buf = consoleBuffer.get(tabId);
+  buf.push({ type, text, ts: Date.now() });
+  if (buf.length > 200) buf.splice(0, buf.length - 200);
+}
+
+async function ensureRuntimeListener(tabId) {
+  if (ensureRuntimeListener._cache && ensureRuntimeListener._cache.has(tabId)) return;
+  if (!ensureRuntimeListener._cache) ensureRuntimeListener._cache = new Set();
+  try {
+    await cdp(tabId, "Runtime.enable").catch(() => {});
+    await cdp(tabId, "Log.enable").catch(() => {});
+    ensureRuntimeListener._cache.add(tabId);
+  } catch (_) {}
+}
+
+async function cmdTrace(tabId, args) {
+  await ensureRuntimeListener(tabId);
+  // 1) screenshot
+  const cap = await cdp(tabId, "Page.captureScreenshot", { format: "png" });
+  const screenshotB64 = cap.data;
+  // 2) page meta
+  const meta = await evald(tabId, "({url:location.href,title:document.title,vp:{w:innerWidth,h:innerHeight,scrollY:scrollY,docH:document.documentElement.scrollHeight}})");
+  const focus = await evald(tabId, "(function(){const a=document.activeElement;if(!a||a===document.body)return null;return{tag:a.tagName,id:a.id||null,role:a.getAttribute&&a.getAttribute('role')||null,value:a.value!==undefined?String(a.value).slice(0,200):null,placeholder:a.placeholder||null,text:(a.innerText||'').trim().slice(0,200)};})()");
+  // 3) a11y tree (interesting only)
+  let ax = null;
+  try {
+    await cdp(tabId, "Accessibility.enable").catch(() => {});
+    const r = await cdp(tabId, "Accessibility.getFullAXTree");
+    ax = flattenAxNodes(r && r.nodes, true).slice(0, 400);
+  } catch (e) { ax = { error: String(e && e.message || e) }; }
+  // 4) recent console
+  const console = (consoleBuffer.get(tabId) || []).slice(-20);
+  // 5) post the bundle to the server
+  const r2 = await fetch(SERVER + "/trace", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      tabId,
+      meta,
+      focus,
+      ax,
+      console,
+      png_b64: screenshotB64,
+      note: (args && args.note) || "",
+    }),
+  });
+  const j = await r2.json();
+  if (!j.ok) throw new Error(j.error || "trace upload failed");
+  return j; // { ok, path, dir, files: [...] }
+}
+
+// Capture console + log messages from the page (Runtime domain).
+// This listener is registered the first time a trace/expect runs.
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (!source || source.tabId == null) return;
+  const tabId = source.tabId;
+  if (method === "Runtime.consoleAPICalled" && params && params.args) {
+    const text = (params.args || []).map(a => {
+      if (a.value !== undefined) return String(a.value);
+      if (a.description) return a.description;
+      return JSON.stringify(a);
+    }).join(" ");
+    recordConsole(tabId, params.type || "log", text);
+  } else if (method === "Log.entryAdded" && params && params.entry) {
+    recordConsole(tabId, params.entry.level || "log", params.entry.text || "");
+  } else if (method === "Runtime.exceptionThrown" && params && params.exceptionDetails) {
+    const d = params.exceptionDetails;
+    recordConsole(tabId, "exception", (d.exception && d.exception.description) || d.text || "exception");
+  }
+});
+
 const COMMANDS = {
   navigate: cmdNavigate,
   eval: cmdEval,
@@ -279,6 +901,14 @@ const COMMANDS = {
   type: cmdType,
   screenshot: cmdScreenshot,
   key: cmdKey,
+  see: cmdSee,
+  // v5 additions
+  axtree: cmdAxtree,
+  axquery: cmdAxquery,
+  expect: cmdExpect,
+  move: cmdMove,
+  scroll: cmdScroll,
+  trace: cmdTrace,
 };
 
 // ---------- network + state ----------
