@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WebBridge server (v2) — simple, robust, stdlib-only.
+WebBridge server (v3) — simple, robust, stdlib-only.
 
 Endpoints:
   GET  /                   health
@@ -11,9 +11,12 @@ Endpoints:
   GET  /result?id=<id>&wait=<ms>  agent waits for a result
   POST /result             extension -> server: post result {id, ok, value|error}
   GET  /log?tail=N         recent log lines
+  POST /screenshot         extension posts {tabId, png_b64} → saved file path
+  POST /trace              extension posts trace bundle → saved dir
 
 Command types: ping, eval, navigate, click, type, html, url, title,
-screenshot, tabs, active_tab.
+screenshot, tabs, active_tab, attach, detach, reload, see, axtree, axquery,
+expect, move, trace.
 """
 
 import argparse
@@ -32,7 +35,9 @@ HOST = "127.0.0.1"
 DEFAULT_PORT = 9876
 LOG_MAX = 300
 RESULT_TTL = 300  # seconds
-SCREENSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
+BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
+SCREENSHOT_DIR = os.path.join(BRIDGE_DIR, "screenshots")
+TRACE_ROOT = os.path.join(BRIDGE_DIR, "traces")
 
 
 class Bridge:
@@ -165,8 +170,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             if p == "/" or p == "/health":
                 return self._send_json(200, {
-                    "ok": True, "service": "webbridge", "version": "2.0",
-                    "endpoints": ["/state", "/poll", "/cmd", "/result", "/log"],
+                    "ok": True, "service": "webbridge", "version": "3.1",
+                    "endpoints": ["/state", "/poll", "/cmd", "/result", "/log", "/screenshot", "/trace"],
+                    "commands": [
+                        "ping", "tabs", "active_tab", "attach", "detach", "reload",
+                        "navigate", "eval", "click", "type", "key", "scroll",
+                        "html", "url", "title", "snippet", "query", "screenshot",
+                        "see", "axtree", "axquery", "expect", "move", "trace",
+                    ],
                 })
             if p == "/state":
                 return self._send_json(200, BRIDGE.get_state())
@@ -245,6 +256,64 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "url": "file:///" + fpath.replace("\\", "/"),
                     "size": os.path.getsize(fpath),
                 })
+            if p == "/trace":
+                # Save a full trace bundle (screenshot + meta + a11y +
+                # console) to webbridge/traces/<ts>/. Used by the
+                # `trace` command in background.js for offline debugging.
+                b64 = body.get("png_b64")
+                if not b64:
+                    return self._send_json(400, {"ok": False, "error": "missing png_b64"})
+                os.makedirs(TRACE_ROOT, exist_ok=True)
+                ts = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+                trace_dir = os.path.join(TRACE_ROOT, ts)
+                os.makedirs(trace_dir, exist_ok=True)
+                files = []
+                # 1) screenshot
+                shot_path = os.path.join(trace_dir, "screenshot.png")
+                with open(shot_path, "wb") as f:
+                    f.write(base64.b64decode(b64))
+                files.append({"name": "screenshot.png", "path": shot_path, "bytes": os.path.getsize(shot_path)})
+                # 2) meta
+                meta = body.get("meta") or {}
+                meta_path = os.path.join(trace_dir, "meta.json")
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, indent=2, ensure_ascii=False)
+                files.append({"name": "meta.json", "path": meta_path, "bytes": os.path.getsize(meta_path)})
+                # 3) focus
+                focus = body.get("focus")
+                if focus is not None:
+                    focus_path = os.path.join(trace_dir, "focus.json")
+                    with open(focus_path, "w", encoding="utf-8") as f:
+                        json.dump(focus, f, indent=2, ensure_ascii=False)
+                    files.append({"name": "focus.json", "path": focus_path, "bytes": os.path.getsize(focus_path)})
+                # 4) a11y
+                ax = body.get("ax")
+                if ax is not None:
+                    ax_path = os.path.join(trace_dir, "a11y.json")
+                    with open(ax_path, "w", encoding="utf-8") as f:
+                        json.dump(ax, f, indent=2, ensure_ascii=False)
+                    files.append({"name": "a11y.json", "path": ax_path, "bytes": os.path.getsize(ax_path)})
+                # 5) console
+                console_msgs = body.get("console") or []
+                console_path = os.path.join(trace_dir, "console.log")
+                with open(console_path, "w", encoding="utf-8") as f:
+                    for m in console_msgs:
+                        f.write(f"[{m.get('ts', 0)}] {m.get('type', 'log')}: {m.get('text', '')}\n")
+                files.append({"name": "console.log", "path": console_path, "bytes": os.path.getsize(console_path)})
+                # 6) optional agent note
+                note = body.get("note")
+                if note:
+                    note_path = os.path.join(trace_dir, "note.txt")
+                    with open(note_path, "w", encoding="utf-8") as f:
+                        f.write(str(note))
+                    files.append({"name": "note.txt", "path": note_path, "bytes": os.path.getsize(note_path)})
+                BRIDGE.log("ext", f"trace saved {trace_dir} ({len(files)} files)")
+                return self._send_json(200, {
+                    "ok": True,
+                    "dir": trace_dir,
+                    "url": "file:///" + trace_dir.replace("\\", "/"),
+                    "files": files,
+                })
             return self._send_json(404, {"ok": False, "error": "no such path"})
         except Exception as e:
             return self._send_json(500, {"ok": False, "error": str(e)})
@@ -266,7 +335,7 @@ def main():
     p.add_argument("port", nargs="?", default=DEFAULT_PORT, type=int)
     args = p.parse_args()
     srv = Server((HOST, args.port), Handler)
-    BRIDGE.log("server", f"webbridge v2 listening on http://{HOST}:{args.port}")
+    BRIDGE.log("server", f"webbridge v3 listening on http://{HOST}:{args.port}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

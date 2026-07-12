@@ -9,16 +9,6 @@ your agent  ──HTTP──▶  local Python server  ◀──CDP──  browse
    (CLI / Python / any tool)   (127.0.0.1:9876)         (your Chrome / Edge)
 ```
 
-## What's new in v1.1
-
-- **`args.await: true` on `eval`** — await Promise-returning expressions. Code that uses `fetch().then(...)` or `new Promise(...)` now resolves correctly.
-- **`tabId` on every command** — target a specific tab by passing `args.tabId` (default: active tab).
-- **`humanize: true` on `click` / `type` / `key`** — anti-detect: mouse trajectories with ease-out curves, per-char typing jitter, "thinking" pauses. Off by default; CI / scraping paths unchanged.
-- **`reload` command** — forces the service worker to reload itself, so an agent can pick up file changes without asking the user to click the chrome://extensions refresh button.
-- **`cdp()` helper** — clean wrapper around `chrome.debugger.sendCommand` inside the SW. No more `cdp is not defined` after refresh.
-
-See [CHANGELOG.md](./CHANGELOG.md) for the full list.
-
 > ## ⚠️ Disclaimer
 >
 > This software gives the operator full browser-automation capability, including on tabs where the user is already authenticated. **You are responsible for everything done through the bridge.**
