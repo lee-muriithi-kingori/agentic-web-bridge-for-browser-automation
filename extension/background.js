@@ -131,7 +131,16 @@ async function ensureAttached(tabId) {
 
 // CDP helper: send a Chrome DevTools Protocol command to the attached tab.
 async function cdp(tabId, method, params) {
-  return await chrome.debugger.sendCommand({ tabId }, method, params || {});
+  try {
+    return await chrome.debugger.sendCommand({ tabId }, method, params || {});
+  } catch (e) {
+    const msg = String(e && e.message || e);
+    if (msg.includes("detach") || msg.includes("Target closed") || msg.includes("no target") || msg.includes("not found")) {
+      attachedTabs.delete(tabId);
+      throw new Error("CDP target detached/closed: " + msg);
+    }
+    throw e;
+  }
 }
 
 // ---------- tab events ----------
@@ -869,6 +878,254 @@ async function cmdTrace(tabId, args) {
   return j; // { ok, path, dir, files: [...] }
 }
 
+// ---------- v5: hover ----------
+//
+// Move mouse to an element's center with a human trajectory, then
+// dispatch mouseenter / mouseover / mousemove DOM events so hover-
+// dependent UI (tooltips, dropdowns) appears.
+async function cmdHover(tabId, args) {
+  const sel = args && args.selector;
+  if (!sel) throw new Error("hover requires selector");
+  const where = await evald(tabId,
+    "(()=>{const e=document.querySelector(" + JSON.stringify(sel) + ");" +
+    "if(!e)throw new Error('no match for '+" + JSON.stringify(sel) + ");" +
+    "e.scrollIntoView({block:'center',behavior:'instant'});" +
+    "const r=e.getBoundingClientRect();" +
+    "return {x:r.left+r.width/2,y:r.top+r.height/2,tag:e.tagName};})()");
+  const last = getLastMouse(tabId);
+  await moveMouseHuman(tabId, last.x, last.y, where.x, where.y);
+  await sleep(jitter(100, 300));
+  await evald(tabId, "(function(sel){" +
+    "const e=document.querySelector(sel);" +
+    "if(!e)return false;" +
+    "const r=e.getBoundingClientRect();" +
+    "const cx=r.left+r.width/2,cy=r.top+r.height/2;" +
+    "const opts={bubbles:true,cancelable:true,clientX:cx,clientY:cy,button:0};" +
+    "e.dispatchEvent(new MouseEvent('mouseenter',opts));" +
+    "e.dispatchEvent(new MouseEvent('mouseover',opts));" +
+    "e.dispatchEvent(new MouseEvent('mousemove',opts));" +
+    "return true;})(" + JSON.stringify(sel) + ")");
+  setLastMouse(tabId, where.x, where.y);
+  return { hovered: where.tag, at: { x: where.x, y: where.y } };
+}
+
+// ---------- v5: drag ----------
+//
+// Drag from one element to another (or from coords to coords).
+// Simulates mousedown → mousemove with jitter → mouseup, plus
+// the full set of DOM drag events (dragstart, drag, dragenter,
+// dragover, drop, dragend).
+async function cmdDrag(tabId, args) {
+  if (!args) throw new Error("drag requires arguments");
+  let fromX, fromY, toX, toY;
+  const fromSel = args.fromSelector || null;
+  const toSel = args.toSelector || null;
+  if (fromSel && toSel) {
+    const from = await evald(tabId, "(function(sel){" +
+      "const e=document.querySelector(sel);" +
+      "if(!e)throw new Error('from not found: '+sel);" +
+      "e.scrollIntoView({block:'center',behavior:'instant'});" +
+      "const r=e.getBoundingClientRect();" +
+      "return {x:r.left+r.width/2,y:r.top+r.height/2};})(" + JSON.stringify(fromSel) + ")");
+    const to = await evald(tabId, "(function(sel){" +
+      "const e=document.querySelector(sel);" +
+      "if(!e)throw new Error('to not found: '+sel);" +
+      "e.scrollIntoView({block:'center',behavior:'instant'});" +
+      "const r=e.getBoundingClientRect();" +
+      "return {x:r.left+r.width/2,y:r.top+r.height/2};})(" + JSON.stringify(toSel) + ")");
+    fromX = from.x; fromY = from.y; toX = to.x; toY = to.y;
+  } else if (typeof args.fromX === "number" && typeof args.fromY === "number" &&
+    typeof args.toX === "number" && typeof args.toY === "number") {
+    fromX = args.fromX; fromY = args.fromY; toX = args.toX; toY = args.toY;
+  } else {
+    throw new Error("drag requires {fromSelector,toSelector} or {fromX,fromY,toX,toY}");
+  }
+  // mousedown at source
+  await cdp(tabId, "Input.dispatchMouseEvent", {
+    type: "mousePressed", x: fromX, y: fromY, button: "left", clickCount: 1,
+  });
+  await sleep(jitter(50, 150));
+  // dragstart on source element
+  if (fromSel) {
+    await evald(tabId, "(function(sel){" +
+      "const e=document.querySelector(sel);" +
+      "if(!e)return;" +
+      "e.dispatchEvent(new DragEvent('dragstart',{bubbles:true,dataTransfer:new DataTransfer()}));" +
+      "})(" + JSON.stringify(fromSel) + ")");
+  }
+  // human-like trajectory from source to destination
+  await moveMouseHuman(tabId, fromX, fromY, toX, toY);
+  // dragover / dragenter on destination
+  if (toSel) {
+    await evald(tabId, "(function(sel){" +
+      "const e=document.querySelector(sel);" +
+      "if(!e)return;" +
+      "const r=e.getBoundingClientRect();" +
+      "const cx=r.left+r.width/2,cy=r.top+r.height/2;" +
+      "const dt=new DataTransfer();" +
+      "e.dispatchEvent(new DragEvent('dragover',{bubbles:true,dataTransfer:dt,clientX:cx,clientY:cy}));" +
+      "e.dispatchEvent(new DragEvent('dragenter',{bubbles:true,dataTransfer:dt,clientX:cx,clientY:cy}));" +
+      "})(" + JSON.stringify(toSel) + ")");
+  }
+  await sleep(jitter(50, 150));
+  // mouseup at destination
+  await cdp(tabId, "Input.dispatchMouseEvent", {
+    type: "mouseReleased", x: toX, y: toY, button: "left", clickCount: 1,
+  });
+  // drop on destination, dragend on source
+  await evald(tabId, "(function(fromSel,toSel){" +
+    "if(toSel){" +
+    "  const e=document.querySelector(toSel);" +
+    "  if(e){" +
+    "    const r=e.getBoundingClientRect();" +
+    "    const cx=r.left+r.width/2,cy=r.top+r.height/2;" +
+    "    const dt=new DataTransfer();" +
+    "    e.dispatchEvent(new DragEvent('drop',{bubbles:true,dataTransfer:dt,clientX:cx,clientY:cy}));" +
+    "  }" +
+    "}" +
+    "if(fromSel){" +
+    "  const e=document.querySelector(fromSel);" +
+    "  if(e)e.dispatchEvent(new DragEvent('dragend',{bubbles:true,dataTransfer:new DataTransfer()}));" +
+    "}" +
+    "})(" + JSON.stringify(fromSel) + "," + JSON.stringify(toSel) + ")");
+  setLastMouse(tabId, toX, toY);
+  return { from: { x: fromX, y: fromY }, to: { x: toX, y: toY } };
+}
+
+// ---------- v5: select ----------
+//
+// Select an option in a <select> element by value or index.
+async function cmdSelect(tabId, args) {
+  if (!args || !args.selector) throw new Error("select requires selector");
+  const sel = args.selector;
+  let expr;
+  if (args.value !== undefined) {
+    expr = "(function(sel,val){" +
+      "const e=document.querySelector(sel);" +
+      "if(!e)throw new Error('select not found: '+sel);" +
+      "if(e.tagName!=='SELECT')throw new Error('not a <select>: '+e.tagName);" +
+      "e.value=String(val);" +
+      "e.dispatchEvent(new Event('input',{bubbles:true}));" +
+      "e.dispatchEvent(new Event('change',{bubbles:true}));" +
+      "return {selected:e.value,selectedIndex:e.selectedIndex};})(" +
+      JSON.stringify(sel) + "," + JSON.stringify(String(args.value)) + ")";
+  } else if (typeof args.index === "number") {
+    expr = "(function(sel,idx){" +
+      "const e=document.querySelector(sel);" +
+      "if(!e)throw new Error('select not found: '+sel);" +
+      "if(e.tagName!=='SELECT')throw new Error('not a <select>: '+e.tagName);" +
+      "if(idx<0||idx>=e.options.length)throw new Error('index out of range: '+idx);" +
+      "e.selectedIndex=idx;" +
+      "e.dispatchEvent(new Event('input',{bubbles:true}));" +
+      "e.dispatchEvent(new Event('change',{bubbles:true}));" +
+      "return {selected:e.value,selectedIndex:e.selectedIndex};})(" +
+      JSON.stringify(sel) + "," + args.index + ")";
+  } else {
+    throw new Error("select requires value or index");
+  }
+  return evald(tabId, expr);
+}
+
+// ---------- v5: cookies ----------
+//
+// Get / set / delete cookies via the CDP Network domain.
+async function cmdCookies(tabId, args) {
+  if (!args || !args.action) throw new Error("cookies requires action");
+  await cdp(tabId, "Network.enable").catch(() => {});
+  const url = await evald(tabId, "location.href");
+  switch (args.action) {
+    case "get": {
+      const r = await cdp(tabId, "Network.getCookies", { urls: [url] });
+      const all = r.cookies || [];
+      if (args.name) {
+        const match = all.find(c => c.name === args.name);
+        return match || null;
+      }
+      return all;
+    }
+    case "set": {
+      if (!args.name || args.value === undefined) throw new Error("cookies set requires name and value");
+      const params = { name: args.name, value: String(args.value), url: url };
+      if (args.domain) params.domain = args.domain;
+      if (args.path) params.path = args.path;
+      if (args.secure !== undefined) params.secure = args.secure;
+      if (args.httpOnly !== undefined) params.httpOnly = args.httpOnly;
+      if (args.sameSite) params.sameSite = args.sameSite;
+      if (args.expires !== undefined) params.expires = args.expires;
+      const r = await cdp(tabId, "Network.setCookie", params);
+      return { success: r.success };
+    }
+    case "delete": {
+      if (!args.name) throw new Error("cookies delete requires name");
+      const params = { name: args.name, url: url };
+      if (args.domain) params.domain = args.domain;
+      if (args.path) params.path = args.path;
+      await cdp(tabId, "Network.deleteCookies", params);
+      return { deleted: args.name };
+    }
+    default:
+      throw new Error("cookies action must be get, set, or delete");
+  }
+}
+
+// ---------- v5: upload ----------
+//
+// Set files on a <input type="file"> element via CDP
+// DOM.setFileInputFiles. Paths must be absolute on the host
+// filesystem.
+async function cmdUpload(tabId, args) {
+  if (!args || !args.selector) throw new Error("upload requires selector");
+  if (!args.files || !Array.isArray(args.files) || args.files.length === 0) {
+    throw new Error("upload requires files array");
+  }
+  // Get a remote object reference for the file input element
+  const r = await cdp(tabId, "Runtime.evaluate", {
+    expression: "(function(sel){" +
+      "const e=document.querySelector(sel);" +
+      "if(!e)throw new Error('input not found: '+sel);" +
+      "if(e.tagName!=='INPUT'||e.type!=='file')throw new Error('element is not a file input');" +
+      "return e;})(" + JSON.stringify(args.selector) + ")",
+  });
+  if (!r.result || !r.result.objectId) {
+    throw new Error("could not get file input element");
+  }
+  await cdp(tabId, "DOM.setFileInputFiles", {
+    files: args.files,
+    objectId: r.result.objectId,
+  });
+  // Dispatch change event so page listeners fire
+  await evald(tabId, "(function(sel){" +
+    "const e=document.querySelector(sel);" +
+    "if(e)e.dispatchEvent(new Event('change',{bubbles:true}));" +
+    "})(" + JSON.stringify(args.selector) + ")");
+  return { uploaded: args.files };
+}
+
+// ---------- v5: back / forward ----------
+async function cmdBack(tabId) {
+  await evald(tabId, "history.back()");
+  return { navigated: "back" };
+}
+async function cmdForward(tabId) {
+  await evald(tabId, "history.forward()");
+  return { navigated: "forward" };
+}
+
+// ---------- v5: refresh ----------
+async function cmdRefresh(tabId, args) {
+  const hard = !!(args && args.hard);
+  await cdp(tabId, "Page.reload", { ignoreCache: hard });
+  return { refreshed: true, hard };
+}
+
+// ---------- v5: console ----------
+async function cmdConsole(tabId, args) {
+  await ensureRuntimeListener(tabId);
+  const count = (args && args.count) || 50;
+  const buf = consoleBuffer.get(tabId) || [];
+  return { messages: buf.slice(-count), total: buf.length };
+}
+
 // Capture console + log messages from the page (Runtime domain).
 // This listener is registered the first time a trace/expect runs.
 chrome.debugger.onEvent.addListener((source, method, params) => {
@@ -909,6 +1166,16 @@ const COMMANDS = {
   move: cmdMove,
   scroll: cmdScroll,
   trace: cmdTrace,
+  // new commands
+  hover: cmdHover,
+  drag: cmdDrag,
+  select: cmdSelect,
+  cookies: cmdCookies,
+  upload: cmdUpload,
+  back: cmdBack,
+  forward: cmdForward,
+  refresh: cmdRefresh,
+  console: cmdConsole,
 };
 
 // ---------- network + state ----------
@@ -984,7 +1251,14 @@ async function pollOnce() {
           if (!t) throw new Error("no active tab");
           targetId = t.id;
         }
-        const value = await handler(targetId, cmd.args);
+        const timeoutMs = (cmd.args && cmd.args.timeout) || 30000;
+        const value = await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("command timed out after " + timeoutMs + "ms")), timeoutMs);
+          handler(targetId, cmd.args).then(
+            v => { clearTimeout(timer); resolve(v); },
+            e => { clearTimeout(timer); reject(e); }
+          );
+        });
         payload = { id: cmd.id, ok: true, value };
       }
     } catch (e) {
