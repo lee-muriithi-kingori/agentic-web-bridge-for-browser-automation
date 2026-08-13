@@ -804,5 +804,162 @@ class TestCrossPlatformPaths(unittest.TestCase):
         self.assertNotIn("\\", url)
 
 
+# ===================================================================
+# v4.2 additions: queue limit, body size limit, shutdown-aware wait,
+#                  GC thread, --require-auth, MCP image blocks
+# ===================================================================
+
+class TestQueueLimit(unittest.TestCase):
+    def test_enqueue_rejected_when_queue_full(self):
+        from webbridge.server import MAX_QUEUE_SIZE
+        b = Bridge(_tmp_data_dir())
+        # Fill the queue to the limit.
+        for i in range(MAX_QUEUE_SIZE):
+            b.enqueue({"id": f"c{i}", "type": "ping", "args": {}})
+        self.assertEqual(len(b.cmd_queue), MAX_QUEUE_SIZE)
+        # Next enqueue should return False (rejected).
+        ok = b.enqueue({"id": "overflow", "type": "ping", "args": {}})
+        self.assertFalse(ok)
+        # Queue size unchanged.
+        self.assertEqual(len(b.cmd_queue), MAX_QUEUE_SIZE)
+
+
+class TestShutdownAwareWait(unittest.TestCase):
+    def test_wait_for_result_unblocks_on_shutdown(self):
+        """A blocked wait_for_result should return None promptly when
+        shutdown() is called — not hang until its own timeout."""
+        b = Bridge(_tmp_data_dir())
+        result = {"got": None}
+        def waiter():
+            result["got"] = b.wait_for_result("no-such-id", wait_ms=10000)
+        t = threading.Thread(target=waiter, daemon=True)
+        t.start()
+        time.sleep(0.2)  # let the waiter block
+        t0 = time.time()
+        b.shutdown()  # should unblock the waiter
+        t.join(timeout=2)
+        elapsed = time.time() - t0
+        self.assertEqual(result["got"], None)
+        self.assertLess(elapsed, 1.0, "wait_for_result should unblock within 1s of shutdown()")
+
+
+class TestRequestBodyLimit(unittest.TestCase):
+    def test_oversized_cmd_returns_413(self):
+        def check(b, url):
+            # Send a JSON body just over MAX_REQUEST_BYTES (we can't actually
+            # send 50MB in a test, so we monkey-patch MAX_REQUEST_BYTES down).
+            import webbridge.server as srv_mod
+            old_limit = srv_mod.MAX_REQUEST_BYTES
+            srv_mod.MAX_REQUEST_BYTES = 100  # tiny limit for the test
+            try:
+                # Build a body > 100 bytes
+                big_args = {"x": "A" * 200}
+                status, body = _post(url, "/cmd", {"type": "ping", "args": big_args})
+                self.assertEqual(status, 413)
+                self.assertFalse(body["ok"])
+                self.assertIn("too large", body["error"])
+            finally:
+                srv_mod.MAX_REQUEST_BYTES = old_limit
+        _with_server(check)
+
+
+class TestGCThread(unittest.TestCase):
+    def test_gc_thread_starts_and_sweeps(self):
+        from webbridge.server import GC_INTERVAL_S, RESULT_TTL
+        b = Bridge(_tmp_data_dir())
+        # Manually insert a stale result (backdated timestamp).
+        with b.lock:
+            b.results["stale-1"] = {"ok": True, "value": "x", "error": None, "ts": time.time() - RESULT_TTL - 10}
+            b.results["fresh-1"] = {"ok": True, "value": "y", "error": None, "ts": time.time()}
+        self.assertEqual(len(b.results), 2)
+        # Run GC manually (we don't want to wait GC_INTERVAL_S in a test).
+        b.gc_results()
+        self.assertEqual(len(b.results), 1)
+        self.assertIn("fresh-1", b.results)
+        self.assertNotIn("stale-1", b.results)
+
+    def test_start_gc_thread_does_not_crash(self):
+        b = Bridge(_tmp_data_dir())
+        b.start_gc_thread()
+        self.assertTrue(b._gc_thread.is_alive())
+        # Starting twice should be a no-op (not crash).
+        b.start_gc_thread()
+        # Clean up.
+        b.shutdown()
+
+
+class TestRequireAuth(unittest.TestCase):
+    def test_require_auth_without_token_exits(self):
+        """--require-auth with no WEBBRIDGE_TOKEN should sys.exit(2)."""
+        import subprocess
+        env = dict(os.environ)
+        env.pop("WEBBRIDGE_TOKEN", None)
+        # We need to invoke the server's main() with --require-auth.
+        # Use a subprocess so the sys.exit doesn't kill the test runner.
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, '.'); from webbridge.server import main; main(['--require-auth', '--port', '0'])"],
+            capture_output=True, text=True, timeout=10, env=env,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("WEBBRIDGE_TOKEN", result.stderr)
+
+
+class TestMCPImageBlocks(unittest.TestCase):
+    """Verify the MCP server returns image content blocks for screenshot tools."""
+
+    def test_wb_screenshot_returns_image_block_when_file_exists(self):
+        from webbridge.mcp import _handle
+        import tempfile
+        # Create a fake screenshot file
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)  # minimal PNG header + junk
+            fake_path = f.name
+        try:
+            # Monkey-patch _call_tool to return a fake screenshot result
+            import webbridge.mcp as mcp_mod
+            original = mcp_mod._call_tool
+            mcp_mod._call_tool = lambda name, args, cfg: {
+                "ok": True,
+                "value": {"path": fake_path, "url": "file://" + fake_path, "size": 100},
+            }
+            try:
+                resp = _handle({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "wb_screenshot", "arguments": {}},
+                }, {"server": "http://127.0.0.1:9876"})
+                self.assertIn("result", resp)
+                content = resp["result"]["content"]
+                # Should have 2 blocks: text + image
+                self.assertEqual(len(content), 2)
+                self.assertEqual(content[0]["type"], "text")
+                self.assertEqual(content[1]["type"], "image")
+                self.assertEqual(content[1]["mimeType"], "image/png")
+                self.assertTrue(len(content[1]["data"]) > 0)
+            finally:
+                mcp_mod._call_tool = original
+        finally:
+            os.unlink(fake_path)
+
+    def test_wb_ping_returns_only_text_block(self):
+        """Non-screenshot tools should return only a text block (no image)."""
+        from webbridge.mcp import _handle
+        import webbridge.mcp as mcp_mod
+        original = mcp_mod._call_tool
+        mcp_mod._call_tool = lambda name, args, cfg: {
+            "ok": True, "value": {"pong": True, "ext": "wb-test", "pinnedTabId": 42},
+        }
+        try:
+            resp = _handle({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "wb_ping", "arguments": {}},
+            }, {"server": "http://127.0.0.1:9876"})
+            content = resp["result"]["content"]
+            self.assertEqual(len(content), 1)
+            self.assertEqual(content[0]["type"], "text")
+        finally:
+            mcp_mod._call_tool = original
+
+
 if __name__ == "__main__":
     unittest.main()

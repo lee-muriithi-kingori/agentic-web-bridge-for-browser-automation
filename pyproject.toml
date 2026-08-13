@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "webbridge"
-version = "4.1.0"
+version = "4.2.0"
 description = "Local-first browser automation bridge — AI agents drive your real Chrome/Edge via CDP, pinned to ONE tab. Auth, long-poll, MCP server, OS-level input."
 readme = "README.md"
 license = {text = "MIT"}

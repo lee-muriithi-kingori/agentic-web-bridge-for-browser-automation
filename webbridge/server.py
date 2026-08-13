@@ -65,6 +65,9 @@ except Exception:  # pragma: no cover
 LOG_MAX: int = 300
 RESULT_TTL: int = 300  # seconds
 POLL_TIMEOUT_MS: int = 25000  # how long /poll will block waiting for a command
+MAX_QUEUE_SIZE: int = 1000  # max commands waiting in the queue (reject with 429 when full)
+MAX_REQUEST_BYTES: int = 50 * 1024 * 1024  # 50 MB cap on any single request body
+GC_INTERVAL_S: int = 60  # how often the background GC thread sweeps stale results
 COMMAND_TYPES: list[str] = [
     "ping", "tabs", "active_tab", "attach", "detach", "reload",
     "navigate", "eval", "click", "type", "key", "scroll",
@@ -172,6 +175,7 @@ class Bridge:
         self.data_dir: str = data_dir
         self.screenshot_dir: str = os.path.join(data_dir, "screenshots")
         self.trace_root: str = os.path.join(data_dir, "traces")
+        self._gc_thread: Optional[threading.Thread] = None
 
     def log(self, who: str, msg: str) -> None:
         """Append a line to the in-memory log and log via stdlib logger."""
@@ -181,8 +185,15 @@ class Bridge:
         logger.info(line)
 
     def enqueue(self, cmd: dict[str, Any]) -> bool:
-        """Add a command to the queue and wake any waiting poller."""
+        """Add a command to the queue and wake any waiting poller.
+
+        Returns True on success, False if the queue is full (MAX_QUEUE_SIZE).
+        Caller should return 429 when this returns False.
+        """
         with self.cond:
+            if len(self.cmd_queue) >= MAX_QUEUE_SIZE:
+                self.log("agent", f"queue full ({MAX_QUEUE_SIZE}), rejected {cmd['type']} id={cmd['id']}")
+                return False
             self.cmd_queue.append(cmd)
             self.log("agent", f"queued {cmd['type']} id={cmd['id']}")
             self.cond.notify_all()
@@ -219,14 +230,18 @@ class Bridge:
             self.cond.notify_all()
 
     def wait_for_result(self, rid: str, wait_ms: int) -> Optional[dict[str, Any]]:
-        """Block until a result is available or timeout. Returns the result
-        dict or ``None`` if timed out."""
+        """Block until a result is available, the timeout elapses, OR the
+        server starts shutting down. Returns the result dict, or ``None`` if
+        timed out / shutting down."""
         deadline = time.time() + (wait_ms / 1000.0)
         with self.cond:
             while True:
                 r = self.results.get(rid)
                 if r is not None:
                     return r
+                # Shutdown-aware: unblock immediately when the server is stopping.
+                if self._shutting_down:
+                    return None
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     return None
@@ -258,6 +273,26 @@ class Bridge:
             stale = [k for k, v in self.results.items() if now - v["ts"] > RESULT_TTL]
             for k in stale:
                 del self.results[k]
+
+    def start_gc_thread(self) -> None:
+        """Start a background daemon thread that sweeps stale results every
+        GC_INTERVAL_S seconds. Doesn't need to be stopped explicitly — it's
+        a daemon, so it dies with the process. The thread exits early when
+        ``is_shutting_down`` becomes True."""
+        if self._gc_thread is not None and self._gc_thread.is_alive():
+            return  # already running
+        def _gc_loop():
+            while not self._shutting_down:
+                time.sleep(GC_INTERVAL_S)
+                if self._shutting_down:
+                    return
+                try:
+                    self.gc_results()
+                except Exception as exc:
+                    logger.warning("GC thread error: %s", exc)
+        t = threading.Thread(target=_gc_loop, name="webbridge-gc", daemon=True)
+        t.start()
+        self._gc_thread = t
 
     def shutdown(self) -> None:
         """Signal the server to shut down and drain the command queue."""
@@ -336,11 +371,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send_json(401, {"ok": False, "error": "unauthorized — set WEBBRIDGE_TOKEN on the server and pass it as a Bearer token or ?token= param"})
 
     def _read_json(self) -> dict[str, Any]:
-        """Read the request body as JSON. Returns ``{}`` on empty body or parse errors."""
+        """Read the request body as JSON. Returns ``{}`` on empty body or parse errors.
+        Rejects bodies larger than MAX_REQUEST_BYTES (returns a sentinel
+        ``{"__body_too_large__": True}`` dict so the caller can 413)."""
         try:
             n = int(self.headers.get("Content-Length", "0") or 0)
             if n == 0:
                 return {}
+            if n > MAX_REQUEST_BYTES:
+                return {"__body_too_large__": True, "size": n, "limit": MAX_REQUEST_BYTES}
             raw = self.rfile.read(n)
             if not raw:
                 return {}
@@ -446,6 +485,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if p == "/cmd":
                 if "__parse_error__" in body:
                     return self._send_json(400, {"ok": False, "error": "invalid JSON"})
+                if "__body_too_large__" in body:
+                    return self._send_json(413, {"ok": False, "error": f"request body too large: {body['size']} bytes > {body['limit']} bytes limit"})
                 cid = body.get("id") or uuid.uuid4().hex[:12]
                 ctype = body.get("type")
                 if not ctype:
@@ -455,7 +496,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "ok": False,
                         "error": f"unknown command type {ctype!r}; use GET /commands for the list",
                     })
-                BRIDGE.enqueue({"id": cid, "type": ctype, "args": body.get("args", {})})
+                if not BRIDGE.enqueue({"id": cid, "type": ctype, "args": body.get("args", {})}):
+                    return self._send_json(429, {"ok": False, "error": f"command queue full ({MAX_QUEUE_SIZE}); retry later"})
                 return self._send_json(200, {"ok": True, "id": cid})
 
             if p == "/result":
@@ -475,6 +517,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(200, {"ok": BRIDGE.post_state(ext_id, body)})
 
             if p == "/screenshot":
+                if "__body_too_large__" in body:
+                    return self._send_json(413, {"ok": False, "error": f"request body too large: {body['size']} bytes > {body['limit']} bytes limit"})
                 b64 = body.get("png_b64")
                 if not b64:
                     return self._send_json(400, {"ok": False, "error": "missing png_b64"})
@@ -493,6 +537,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 })
 
             if p == "/trace":
+                if "__body_too_large__" in body:
+                    return self._send_json(413, {"ok": False, "error": f"request body too large: {body['size']} bytes > {body['limit']} bytes limit"})
                 b64 = body.get("png_b64")
                 if not b64:
                     return self._send_json(400, {"ok": False, "error": "missing png_b64"})
@@ -663,6 +709,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="log level (env: WEBBRIDGE_LOG_LEVEL, default: INFO)")
     p.add_argument("--log-file", default=os.environ.get("WEBBRIDGE_LOG_FILE"),
                    help="optional log file path (env: WEBBRIDGE_LOG_FILE)")
+    p.add_argument("--require-auth", action="store_true",
+                   help="fail to start if WEBBRIDGE_TOKEN is not set (use in production / shared hosts)")
     return p.parse_args(argv)
 
 
@@ -671,9 +719,19 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
     setup_logging(args.log_level, args.log_file)
 
+    auth_enabled = bool(os.environ.get("WEBBRIDGE_TOKEN"))
+    if args.require_auth and not auth_enabled:
+        sys.stderr.write(
+            "ERROR: --require-auth was passed but WEBBRIDGE_TOKEN is not set.\n"
+            "Set WEBBRIDGE_TOKEN in the environment (e.g. export WEBBRIDGE_TOKEN=$(openssl rand -hex 32))\n"
+            "and restart the server.\n"
+        )
+        sys.exit(2)
+
     data_dir = _default_data_dir()
     global BRIDGE  # noqa: PLW0603
     BRIDGE = Bridge(data_dir)
+    BRIDGE.start_gc_thread()  # background sweep of stale results
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -681,11 +739,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     srv = Server((args.host, args.port), Handler)
 
     # Print a clear startup banner with the data dir + auth status.
-    auth_enabled = bool(os.environ.get("WEBBRIDGE_TOKEN"))
     BRIDGE.log("server", f"webbridge v{_PKG_VERSION} listening on http://{args.host}:{args.port}")
     BRIDGE.log("server", f"data_dir: {data_dir}")
     BRIDGE.log("server", f"auth: {'ENABLED (WEBBRIDGE_TOKEN set)' if auth_enabled else 'DISABLED (set WEBBRIDGE_TOKEN to enable)'}")
     BRIDGE.log("server", f"pyautogui: {'available' if pyautogui else 'not installed (pip install webbridge[os])'}")
+    BRIDGE.log("server", f"limits: queue={MAX_QUEUE_SIZE}, body={MAX_REQUEST_BYTES // 1024 // 1024}MB, gc={GC_INTERVAL_S}s")
 
     try:
         srv.serve_forever()

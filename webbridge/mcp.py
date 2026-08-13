@@ -37,6 +37,7 @@ feature set (resources, prompts, sampling), you can swap this for a
 thin wrapper that delegates to `mcp.server.Server`.
 """
 
+import base64
 import json
 import os
 import sys
@@ -352,18 +353,52 @@ def _handle(req: dict[str, Any], cfg: dict[str, Any]) -> Optional[dict[str, Any]
             result = _call_tool(tool_name, tool_args, cfg)
             if result.get("ok"):
                 value = result.get("value")
-                # MCP expects content as a list of {type, text} blocks.
+                # Build MCP content blocks. Some tools return both text AND
+                # an image (wb_screenshot, wb_vision) — we emit both so any
+                # MCP client that supports image content blocks can render
+                # the screenshot, while text-only clients still get useful info.
+                content: list[dict[str, Any]] = []
+
+                # 1) Text block (always present — describes what came back)
                 if isinstance(value, str):
                     text = value
                 elif isinstance(value, dict) and "textBlock" in value:
                     # readable command — return the text block (best for LLMs)
                     text = value["textBlock"]
+                elif isinstance(value, dict) and "readable" in value and isinstance(value["readable"], dict):
+                    # vision command — return the readable textBlock as text
+                    text = value["readable"].get("textBlock", json.dumps(value, indent=2, default=str))
                 else:
                     text = json.dumps(value, indent=2, default=str)
+                content.append({"type": "text", "text": text})
+
+                # 2) Image block (for wb_screenshot / wb_vision / wb_osscreenshot)
+                #    The MCP spec supports image content blocks — clients that
+                #    understand them (Cursor, Cline, future Claude Desktop)
+                #    will render the screenshot inline. Text-only clients
+                #    just ignore the image block and use the text above.
+                image_path = None
+                if tool_name in ("wb_screenshot", "wb_osscreenshot"):
+                    image_path = value.get("path") if isinstance(value, dict) else None
+                elif tool_name == "wb_vision" and isinstance(value, dict):
+                    image_path = value.get("screenshot_path")
+
+                if image_path and os.path.isfile(image_path):
+                    try:
+                        with open(image_path, "rb") as f:
+                            img_b64 = base64.b64encode(f.read()).decode("ascii")
+                        # Sniff the MIME type from the extension
+                        ext = os.path.splitext(image_path)[1].lower()
+                        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}.get(ext, "image/png")
+                        content.append({"type": "image", "data": img_b64, "mimeType": mime})
+                    except Exception:
+                        # If we can't read the file, just skip the image block — text still useful.
+                        pass
+
                 return {
                     "jsonrpc": "2.0",
                     "id": req_id,
-                    "result": {"content": [{"type": "text", "text": text}]},
+                    "result": {"content": content},
                 }
             else:
                 return {

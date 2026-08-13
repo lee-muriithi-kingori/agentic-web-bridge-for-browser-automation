@@ -125,15 +125,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
 
 function log(...a) { console.log("[webbridge]", ...a); }
 
-// ---------- anti-detect: random pre-action jitter ----------
-async function preActionJitter() { await sleep(jitter(120, 600)); }
-
 // ---------- anti-detect helpers ----------
 
 // Random delay helpers (humans are not metronomes).
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 function jitter(min, max) { return min + Math.random() * (max - min); }
-async function humanDelay(min = 80, max = 350) { await sleep(jitter(min, max)); }
 
 // Move the mouse from (fromX,fromY) to (toX,toY) in a few mouseMoved events
 // so anti-bot heuristics see a real cursor trajectory, not a teleport.

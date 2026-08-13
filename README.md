@@ -48,6 +48,20 @@ This is a **breaking** revamp. The biggest change: the bridge now operates on **
 | **Cross-platform paths** | No more hardcoded `/tmp/` in tests (uses `tempfile.mkdtemp`). Default data dir is now per-OS (`~/.local/share/webbridge` on Linux, `~/Library/Application Support/webbridge` on macOS, `%LOCALAPPDATA%\webbridge` on Windows). `file://` URLs work on Windows (`file:///C:/...`). |
 | **144 tests** (was 132) | New tests cover auth (enabled/disabled, Bearer header, query param, wrong token), long-poll blocking, cross-platform path helpers. |
 
+### v4.2 additions
+
+| Change | Why |
+|---|---|
+| **Request body size limit (`MAX_REQUEST_BYTES` = 50 MB)** | Prevents a 1GB POST to `/trace` or `/screenshot` from OOMing the server. Oversized bodies get a `413 Payload Too Large` response. |
+| **Queue size limit (`MAX_QUEUE_SIZE` = 1000)** | A runaway agent can no longer OOM the server by enqueueing millions of commands. The 1001st command gets a `429 Too Many Commands` response. |
+| **`wait_for_result` is shutdown-aware** | A blocked agent unblocks immediately when the server shuts down — no more hanging until your own `--wait` timeout. |
+| **Background GC thread** | Stale results are swept every 60s by a daemon thread, not lazily on `/poll`. No more unbounded growth when the extension is disconnected. |
+| **`--require-auth` flag** | `python server.py --require-auth` fails to start if `WEBBRIDGE_TOKEN` is not set. Use in production / shared hosts to enforce auth. |
+| **MCP image content blocks** | `wb_screenshot`, `wb_vision`, and `wb_osscreenshot` now return BOTH a text block AND an image content block (base64 PNG). Clients that support image blocks (Cursor, Cline, future Claude Desktop) render the screenshot inline; text-only clients just use the text block. |
+| **Dead code removed from `background.js`** | `preActionJitter()` and `humanDelay()` were declared but never called — deleted. |
+| **152 tests** (was 144) | New tests cover queue limit, shutdown-aware wait, body size limit (413), GC thread, `--require-auth` exit code, MCP image blocks. |
+
+
 
 ---
 
@@ -522,7 +536,7 @@ These can be disabled per-command (`humanize: false` in args) or tuned in `backg
 ## Testing
 
 ```bash
-# Run all unit tests (144 tests across server + client)
+# Run all unit tests (152 tests across server + client)
 python -m pytest tests/ -v
 # or with unittest:
 python -m unittest discover tests -v
@@ -531,9 +545,9 @@ python -m unittest discover tests -v
 python -m unittest tests.test_integration -v
 ```
 
-144 unit tests cover the server Bridge class, HTTP handler (including `/os`, `/version`, auth, and long-poll), client CLI, argument parsing, cross-platform path helpers, and the v4 command types. Integration tests auto-detect server availability and skip gracefully (note: they check the server but NOT whether a tab is pinned — if the server is up but no tab is pinned, integration tests will run and fail with the "no pinned tab" error, which is itself a useful signal).
+152 unit tests cover the server Bridge class, HTTP handler (including `/os`, `/version`, auth, long-poll, queue limit, body size limit, GC thread, shutdown-aware wait), client CLI, argument parsing, cross-platform path helpers, MCP image blocks, and the v4 command types. Integration tests auto-detect server availability and skip gracefully (note: they check the server but NOT whether a tab is pinned — if the server is up but no tab is pinned, integration tests will run and fail with the "no pinned tab" error, which is itself a useful signal).
 
-CI runs the 144 unit tests on every push/PR, across Python 3.9–3.13 on Ubuntu, Windows, and macOS. See `.github/workflows/test.yml`.
+CI runs the 152 unit tests on every push/PR, across Python 3.9–3.13 on Ubuntu, Windows, and macOS. See `.github/workflows/test.yml`.
 
 ---
 
@@ -549,13 +563,13 @@ CI runs the 144 unit tests on every push/PR, across Python 3.9–3.13 on Ubuntu,
 │   └── popup.js           # Popup logic (pin/unpin, token save, server health, ping)
 ├── webbridge/             # Installable Python package
 │   ├── __init__.py        # Re-exports __version__
-│   ├── _version.py        # Single source of truth for version (4.1.0)
+│   ├── _version.py        # Single source of truth for version (4.2.0)
 │   ├── __main__.py        # python -m webbridge entry
-│   ├── server.py          # Server module (Bridge, Handler, /os, /version, auth, long-poll, cross-platform paths)
+│   ├── server.py          # Server module (Bridge, Handler, /os, /version, auth, long-poll, queue limit, body limit, GC thread, cross-platform paths)
 │   ├── client.py          # Client module (30+ subcommands, OS-level commands, Bearer auth)
-│   └── mcp.py             # MCP server (24 tools, stdio JSON-RPC, stdlib-only)
+│   └── mcp.py             # MCP server (24 tools, stdio JSON-RPC, stdlib-only, image content blocks)
 ├── tests/
-│   ├── test_server.py     # 75+ server tests (incl. auth, long-poll, cross-platform paths)
+│   ├── test_server.py     # 80+ server tests (incl. auth, long-poll, cross-platform paths, queue limit, body limit, GC thread, --require-auth, MCP image blocks)
 │   ├── test_client.py     # 70+ client tests (incl. v4 commands, OS-level commands)
 │   ├── test_integration.py # 6 integration tests (require browser)
 │   └── conftest.py        # Test fixtures
@@ -564,7 +578,7 @@ CI runs the 144 unit tests on every push/PR, across Python 3.9–3.13 on Ubuntu,
 ├── examples/
 │   ├── find_bounties.py   # GitHub bounty finder
 │   └── leadgen.py         # Contact extractor (note: example uses hardcoded URLs, not Google search)
-├── pyproject.toml         # Package config (v4.1.0, optional [os] and [dev] extras, webbridge-mcp entry point)
+├── pyproject.toml         # Package config (v4.2.0, optional [os] and [dev] extras, webbridge-mcp entry point)
 ├── start.bat              # Windows launcher (uses --port flag)
 ├── start.sh               # Unix launcher (uses --port flag)
 ├── LICENSE                # MIT
@@ -576,16 +590,16 @@ CI runs the 144 unit tests on every push/PR, across Python 3.9–3.13 on Ubuntu,
 
 ## Known limitations (honest list)
 
-- **Auth is opt-in, not on by default.** `WEBBRIDGE_TOKEN` must be set explicitly. If you forget, anyone who can reach `127.0.0.1:9876` can drive the pinned tab. The startup banner now prints whether auth is enabled, so it's hard to miss — but it's still your responsibility to set it on shared hosts.
-- **No request body size limit.** A 1GB POST to `/trace` is loaded into memory in full.
+- **Auth is opt-in, not on by default.** `WEBBRIDGE_TOKEN` must be set explicitly. If you forget, anyone who can reach `127.0.0.1:9876` can drive the pinned tab. The startup banner now prints whether auth is enabled, so it's hard to miss — and `--require-auth` will fail to start if you forget. But it's still your responsibility to set it on shared hosts.
 - **`reload` command** (in the extension) calls `chrome.runtime.reload()`, which resets the extension state. Useful for development; mildly dangerous in production.
-- **Screenshots are base64-encoded JSON POSTs** — hits CDP message-size limits on some very large pages. No streaming yet.
-- **`/os` is synchronous** — long OS-level operations block the HTTP handler. Fine for clicks/typing; not fine for a 30-second `typewrite` of a 10000-char string.
+- **Screenshots are base64-encoded JSON POSTs** — hits CDP message-size limits on some very large pages. No streaming yet. The 50 MB body cap will reject pathological cases.
+- **`/os` is synchronous** — long OS-level operations block that one HTTP request (the server is `ThreadingTCPServer`, so other requests still proceed). Fine for clicks/typing; not fine for a 30-second `typewrite` of a 10000-char string. If you need async OS, run it client-side or contribute a thread-pool PR.
 - **OS-level commands bypass the pinned-tab guard** (they don't touch the browser at all — they're for the desktop). This is by design (you might want to click a native dialog that's blocking the browser), but it means the `/os` endpoint can drive anything on your desktop. Be careful.
-- **MCP server doesn't support image content blocks.** `wb_vision` returns the readable text companion as the tool result, but the screenshot stays on disk. Most MCP clients (Claude Desktop as of this writing) don't yet support image content blocks in tool results, so the bridge can't push the screenshot through the MCP layer. To use vision, call `wb_screenshot` to get the file path, then forward the bytes to your VLM separately.
-- **MCP server implements a minimal subset of the spec.** It supports `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`. It does NOT support `resources/*`, `prompts/*`, or `sampling/*`. If you need those, swap `webbridge/mcp.py` for a thin wrapper around the official `mcp` package.
+- **MCP server implements a minimal subset of the spec.** It supports `initialize`, `notifications/initialized`, `tools/list`, and `tools/call` (with text AND image content blocks). It does NOT support `resources/*`, `prompts/*`, or `sampling/*`. If you need those, swap `webbridge/mcp.py` for a thin wrapper around the official `mcp` package.
+- **MCP image blocks depend on client support.** The server emits them per spec, but Claude Desktop (as of this writing) doesn't render image content blocks in tool results yet. Cursor and Cline do. To use vision with a text-only MCP client, call `wb_screenshot` to get the file path, then forward the bytes to your VLM separately.
 - **CI workflow runs unit tests only.** Integration tests (which require a real browser + extension + pinned tab) are not run in CI — they're for local/manual verification only.
 - **`/poll` long-poll is capped at 25 seconds** (`POLL_TIMEOUT_MS` in `server.py`). If you want longer, change the constant — but be aware that some network stacks / proxies will close idle connections before 25s.
+- **No request body size limit on the `/os` endpoint's response.** A `screenshot` action returns a base64 PNG inline — if your desktop is huge (8K+), the response can be several MB. The request body limit (50 MB) doesn't help here; the response is what's big.
 
 ---
 
