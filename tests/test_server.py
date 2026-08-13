@@ -11,8 +11,8 @@ import unittest
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import server as srv_mod
-from server import Bridge, Handler, Server, RESULT_TTL, COMMAND_TYPES
+import webbridge.server as srv_mod
+from webbridge.server import Bridge, Handler, Server, RESULT_TTL, COMMAND_TYPES, BRIDGE
 
 
 # ---------------------------------------------------------------------------
@@ -27,6 +27,8 @@ def _free_port():
 
 def _start_server(data_dir):
     """Start a server on a random port. Returns (bridge, server, url, thread)."""
+    import webbridge.server as srv_mod
+
     port = _free_port()
     bridge = Bridge(data_dir)
     old_br = getattr(srv_mod, "BRIDGE", None)
@@ -41,6 +43,8 @@ def _start_server(data_dir):
 
 
 def _stop_server(srv, t):
+    import webbridge.server as srv_mod
+
     srv.shutdown()
     t.join(timeout=2)
     old_br = getattr(srv, "_old_br", None)
@@ -314,7 +318,12 @@ class TestHandlerHealth(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertTrue(body["ok"])
             self.assertEqual(body["service"], "webbridge")
-            self.assertEqual(body["version"], "4.0")
+            # Version is now a single source of truth from webbridge._version
+            self.assertTrue(body["version"].startswith("4.0"))
+            # New in v4: pyautogui availability flag and /os, /version endpoints
+            self.assertIn("pyautogui", body)
+            self.assertIn("/os", body["endpoints"])
+            self.assertIn("/version", body["endpoints"])
         _with_server(check)
 
     def test_get_health(self):
@@ -548,6 +557,92 @@ class TestWaitBlocking(unittest.TestCase):
         self.assertEqual(len(dequeued), 20)
         self.assertEqual(dequeued[0]["id"], "c0")
         self.assertEqual(dequeued[-1]["id"], "c19")
+
+
+# ===================================================================
+# v4 additions: readable / vision command types, /os endpoint, /version
+# ===================================================================
+
+class TestV4CommandTypes(unittest.TestCase):
+    def test_readable_in_command_types(self):
+        self.assertIn("readable", COMMAND_TYPES)
+
+    def test_vision_in_command_types(self):
+        self.assertIn("vision", COMMAND_TYPES)
+
+    def test_readable_command_round_trips(self):
+        """`readable` should enqueue like any other command type."""
+        b = Bridge("/tmp/wb_test")
+        b.enqueue({"id": "r1", "type": "readable", "args": {"maxChars": 1000}})
+        cmd = b.dequeue("ext")
+        self.assertEqual(cmd["type"], "readable")
+        self.assertEqual(cmd["args"]["maxChars"], 1000)
+
+    def test_vision_command_round_trips(self):
+        b = Bridge("/tmp/wb_test")
+        b.enqueue({"id": "v1", "type": "vision", "args": {"prompt": "describe"}})
+        cmd = b.dequeue("ext")
+        self.assertEqual(cmd["type"], "vision")
+        self.assertEqual(cmd["args"]["prompt"], "describe")
+
+
+class TestVersionEndpoint(unittest.TestCase):
+    def test_get_version(self):
+        def check(b, url):
+            status, body = _get(url, "/version")
+            self.assertEqual(status, 200)
+            self.assertTrue(body["ok"])
+            self.assertTrue(body["package"].startswith("4.0"))
+            self.assertEqual(body["extension"], "2.0.0")
+            # pyautogui_available is a bool, present either way
+            self.assertIsInstance(body["pyautogui_available"], bool)
+        _with_server(check)
+
+
+class TestOSEndpoint(unittest.TestCase):
+    """Tests for POST /os — pyautogui hybrid mode.
+
+    These tests don't require pyautogui to be installed; they verify the
+    endpoint correctly reports the missing-dependency case and rejects
+    unknown actions.
+    """
+
+    def _post(self, url, path, payload):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", url.split(":")[2])
+        c.request("POST", path, json.dumps(payload), {"Content-Type": "application/json"})
+        r = c.getresponse()
+        body = json.loads(r.read().decode("utf-8"))
+        c.close()
+        return r.status, body
+
+    def test_os_missing_action(self):
+        def check(b, url):
+            status, body = self._post(url, "/os", {})
+            self.assertEqual(status, 400)
+            self.assertFalse(body["ok"])
+            self.assertIn("action", body["error"])
+        _with_server(check)
+
+    def test_os_unknown_action_rejected(self):
+        def check(b, url):
+            status, body = self._post(url, "/os", {"action": "hackTheGibson", "args": {}})
+            self.assertEqual(status, 400)
+            self.assertFalse(body["ok"])
+            self.assertIn("allowlist", body["error"])
+        _with_server(check)
+
+    def test_os_allowlist_includes_common_actions(self):
+        # Don't actually call pyautogui — just verify the allowlist logic
+        # by sending an action that's in the allowlist and checking that
+        # the server doesn't reject it as "unknown" (it'll fail later
+        # because pyautogui isn't installed, but that's a 500 not a 400).
+        def check(b, url):
+            status, body = self._post(url, "/os", {"action": "click", "args": {"x": 0, "y": 0}})
+            # Either 500 (pyautogui not installed) or 200 (it is). Either way
+            # we should NOT get a 400 "not in allowlist" error.
+            self.assertNotEqual(status, 400)
+        _with_server(check)
 
 
 if __name__ == "__main__":

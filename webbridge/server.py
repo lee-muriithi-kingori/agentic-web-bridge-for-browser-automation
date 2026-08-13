@@ -44,6 +44,17 @@ from collections import deque
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
+try:
+    import pyautogui  # optional — only needed for /os endpoint
+except Exception:  # pragma: no cover
+    pyautogui = None  # type: ignore
+
+# Single source of truth for the package version.
+try:
+    from webbridge._version import __version__ as _PKG_VERSION  # type: ignore
+except Exception:  # pragma: no cover
+    _PKG_VERSION = "4.0.0"
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -53,10 +64,13 @@ RESULT_TTL: int = 300  # seconds
 COMMAND_TYPES: list[str] = [
     "ping", "tabs", "active_tab", "attach", "detach", "reload",
     "navigate", "eval", "click", "type", "key", "scroll",
-    "html", "url", "title", "snippet", "query", "screenshot",
+    "html", "url", "title", "snippet", "readable", "query", "screenshot",
     "see", "axtree", "axquery", "expect", "move", "trace",
     "hover", "drag", "select", "cookies", "upload",
     "back", "forward", "refresh", "console",
+    # Vision / VLM-friendly (screenshot is reused; these are hints to the
+    # caller, but having explicit types lets agents auto-discover them).
+    "vision",
 ]
 
 # ---------------------------------------------------------------------------
@@ -197,6 +211,12 @@ class Bridge:
 # HTTP handler
 # ---------------------------------------------------------------------------
 
+# Module-level singleton Bridge instance. Populated by main(); tests can
+# monkey-patch it directly. Declared at module scope so `from webbridge.server
+# import BRIDGE` works at import time (returns None until main() is called).
+BRIDGE: Optional["Bridge"] = None
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     """Request handler for the WebBridge HTTP API."""
 
@@ -252,12 +272,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             if p == "/" or p == "/health":
                 return self._send_json(200, {
-                    "ok": True, "service": "webbridge", "version": "4.0",
+                    "ok": True, "service": "webbridge", "version": _PKG_VERSION,
+                    "pyautogui": pyautogui is not None,
                     "endpoints": [
                         "/state", "/poll", "/cmd", "/result", "/log",
                         "/commands", "/screenshot", "/trace", "/shutdown",
+                        "/os", "/version",
                     ],
                     "commands": COMMAND_TYPES,
+                })
+
+            if p == "/version":
+                return self._send_json(200, {
+                    "ok": True,
+                    "package": _PKG_VERSION,
+                    "extension": "2.0.0",
+                    "pyautogui_available": pyautogui is not None,
                 })
 
             if p == "/state":
@@ -417,6 +447,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 BRIDGE.log("server", "shutdown requested via POST /shutdown")
                 threading.Thread(target=_do_shutdown, args=(self.server,), daemon=True).start()
                 return self._send_json(200, {"ok": True, "message": "shutting down"})
+
+            if p == "/os":
+                # OS-level input via pyautogui — for hybrid automation when
+                # CDP can't reach (minimized windows, native dialogs, file
+                # pickers, OS-level mouse/keyboard that has to happen OUTSIDE
+                # the browser tab). Synchronous — these commands don't need
+                # to round-trip through the extension.
+                action = body.get("action")
+                if not action:
+                    return self._send_json(400, {"ok": False, "error": "missing action"})
+                args_ = body.get("args", {}) or {}
+                # Allowlist of safe pyautogui actions.
+                safe = {
+                    "click", "rightClick", "doubleClick", "tripleClick",
+                    "moveTo", "moveRel", "dragTo", "dragRel",
+                    "typewrite", "press", "hotkey", "keyDown", "keyUp",
+                    "screenshot", "size", "position", "scroll",
+                }
+                if action not in safe:
+                    return self._send_json(400, {
+                        "ok": False,
+                        "error": f"action {action!r} not in allowlist: {sorted(safe)}",
+                    })
+                if pyautogui is None:
+                    return self._send_json(500, {
+                        "ok": False,
+                        "error": "pyautogui not installed; install with: pip install webbridge[os]",
+                    })
+                try:
+                    fn = getattr(pyautogui, action)
+                    # `screenshot` returns a PIL Image — serialize as PNG b64.
+                    if action == "screenshot":
+                        img = fn()
+                        import io
+                        buf = io.BytesIO()
+                        img.save(buf, format="PNG")
+                        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                        # Also save to disk for convenience.
+                        os.makedirs(BRIDGE.screenshot_dir, exist_ok=True)
+                        ts = time.strftime("%Y%m%d-%H%M%S")
+                        fpath = os.path.join(BRIDGE.screenshot_dir, f"os-shot-{ts}-{uuid.uuid4().hex[:6]}.png")
+                        with open(fpath, "wb") as f:
+                            f.write(base64.b64decode(b64))
+                        result: Any = {"path": fpath, "png_b64": b64, "size": img.size}
+                    elif action in ("size", "position"):
+                        result = tuple(fn())
+                    else:
+                        result = fn(**args_)
+                    BRIDGE.log("agent", f"os.{action}({args_}) -> ok")
+                    return self._send_json(200, {"ok": True, "value": result})
+                except Exception as exc:
+                    BRIDGE.log("agent", f"os.{action}({args_}) -> error: {exc}")
+                    return self._send_json(500, {"ok": False, "error": str(exc)})
 
             return self._send_json(404, {"ok": False, "error": "no such path"})
 

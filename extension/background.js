@@ -10,12 +10,98 @@
 // to the active tab, and results posted back.
 
 const SERVER = "http://127.0.0.1:9876";
-const EXT_ID = "wb-" + Math.random().toString(36).slice(2, 10);
 const POLL_MS = 800;
+
+// Persist a stable extension id across service-worker restarts.
+// (MV3 kills the SW after ~30s idle, which used to regenerate EXT_ID and
+// confuse the Python server into thinking a new extension had connected.)
+let EXT_ID = "wb-pending";
+chrome.storage.local.get(["extId"]).then(({ extId }) => {
+  if (extId) {
+    EXT_ID = extId;
+  } else {
+    EXT_ID = "wb-" + Math.random().toString(36).slice(2, 10);
+    chrome.storage.local.set({ extId: EXT_ID });
+  }
+});
 
 const knownTabs = new Map();
 let activeTabId = null;
 const attachedTabs = new Set();   // tabIds where we have a debugger session
+
+// ---------- designated-tab guard ----------
+//
+// SECURITY: only ONE tab can be driven at a time. The user picks it from
+// the popup ("Pin this tab"); the choice is persisted in chrome.storage.local
+// and survives SW restarts. Any command that doesn't target the pinned tab
+// is rejected with a clear error.
+//
+// Why this matters: previously the bridge defaulted to "the active tab",
+// which silently followed the user's focus — switch to Gmail, the agent is
+// now driving Gmail. Worse, the server could supply cmd.args.tabId to target
+// ANY open tab. Both paths are now closed.
+
+async function getDesignatedTabId() {
+  const { designatedTabId } = await chrome.storage.local.get("designatedTabId");
+  return designatedTabId != null ? Number(designatedTabId) : null;
+}
+
+async function resolveTargetTabId(cmd) {
+  // Resolve which tab this command should run against.
+  // Returns { tabId } or throws an Error the caller can post back.
+  const pinned = await getDesignatedTabId();
+  const requested = cmd.args && cmd.args.tabId != null ? Number(cmd.args.tabId) : null;
+  if (pinned == null) {
+    throw new Error(
+      "no pinned tab — open the WebBridge popup and click \"Pin this tab\" on the tab you want the agent to drive"
+    );
+  }
+  if (requested != null && requested !== pinned) {
+    throw new Error(
+      `command targets tab ${requested} but only the pinned tab (${pinned}) can be driven; ` +
+      `re-pin the desired tab from the popup if you want to switch`
+    );
+  }
+  // Sanity-check the pinned tab still exists.
+  try {
+    await chrome.tabs.get(pinned);
+  } catch (_) {
+    // Tab was closed — clear the pin so the user is forced to re-pin.
+    await chrome.storage.local.remove([
+      "designatedTabId", "designatedUrl", "designatedTitle", "designatedAt"
+    ]);
+    throw new Error(`pinned tab ${pinned} no longer exists; re-pin a tab from the popup`);
+  }
+  return pinned;
+}
+
+// If the pinned tab is closed by the user, clear the pin so the popup shows "none".
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const pinned = await getDesignatedTabId();
+  if (pinned === tabId) {
+    await chrome.storage.local.remove([
+      "designatedTabId", "designatedUrl", "designatedTitle", "designatedAt"
+    ]);
+    log(`pinned tab ${tabId} was closed; pin cleared`);
+  }
+  attachedTabs.delete(tabId);
+  lastMouse.delete(tabId);
+  consoleBuffer.delete(tabId);
+  knownTabs.delete(tabId);
+});
+
+// Popup → SW channel (so "Pin this tab" reacts immediately instead of
+// waiting up to POLL_MS for the next poll cycle).
+chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
+  // No async work here — just a notification. The next pollOnce() will pick
+  // up the new pinned-tab id from storage.
+  if (msg && msg.type === "designated") {
+    log(`popup pinned tab ${msg.tabId}`);
+  } else if (msg && msg.type === "unpinned") {
+    log("popup unpinned tab");
+  }
+  return false;  // synchronous, no response expected
+});
 
 // ---------- helpers ----------
 
@@ -218,6 +304,175 @@ async function cmdHtml(tabId, args) {
 async function cmdSnippet(tabId) {
   return evald(tabId,
     "(()=>{const m=document.querySelector('main')||document.body;const t=(m?m.innerText:document.body.innerText)||'';return t.replace(/\\s+/g,' ').trim().slice(0,2000);})()");
+}
+
+// ---------- readable: LLM-optimized text dump of the page ----------
+//
+// Goal: give a text-only LLM (no vision) everything it needs to understand
+// and act on the page — URLs, titles, visible text, form structure,
+// interactive elements with selectors, and the accessibility tree — in a
+// compact, deterministic text format. No base64, no HTML, no images.
+//
+// `readable` returns a dict with several fields so the caller can pick
+// what they need (or just pass the whole thing to the LLM as one block).
+//
+// Args:
+//   maxChars   (default 20000)  — cap per text field
+//   includeA11y (default true)  — include the accessibility-tree dump
+//   includeForms (default true) — include form/interactive element list
+//   includeConsole (default false) — include last N console messages
+
+async function cmdReadable(tabId, args) {
+  const maxChars = (args && args.maxChars) || 20000;
+  const includeA11y = args && args.includeA11y !== false;
+  const includeForms = args && args.includeForms !== false;
+  const includeConsole = args && args.includeConsole === true;
+
+  // 1) Page metadata + visible text — collected in ONE Runtime.evaluate
+  //    call so we round-trip once.
+  const meta = await evald(tabId, `(()=>{
+    const main = document.querySelector('main') || document.body;
+    const visible = (main ? main.innerText : (document.body && document.body.innerText)) || '';
+    const meta = {};
+    for (const m of document.querySelectorAll('meta[name],meta[property]')) {
+      const k = m.getAttribute('name') || m.getAttribute('property');
+      const v = m.getAttribute('content');
+      if (k && v) meta[k] = v;
+    }
+    return {
+      url: location.href,
+      title: document.title || '',
+      description: meta['description'] || meta['og:description'] || '',
+      viewport: { w: window.innerWidth, h: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY },
+      visibleText: visible.replace(/\\s+/g, ' ').trim().slice(0, ${maxChars}),
+      headings: Array.from(document.querySelectorAll('h1,h2,h3')).slice(0, 50).map(h => ({
+        level: parseInt(h.tagName.slice(1), 10),
+        text: (h.innerText || '').trim().slice(0, 200)
+      })),
+      meta: meta
+    };
+  })()`);
+
+  // 2) Interactive elements — buttons, links, inputs, selects, textareas.
+  //    Each gets a stable selector the agent can use with `click` / `type`.
+  let forms = null;
+  if (includeForms) {
+    forms = await evald(tabId, `(()=>{
+      const out = [];
+      const seen = new Set();
+      const els = document.querySelectorAll('a,button,input,select,textarea,[role="button"],[role="link"],[role="checkbox"],[role="tab"],[onclick]');
+      for (const e of els) {
+        if (seen.has(e)) continue;
+        seen.add(e);
+        // Skip hidden / display:none elements
+        const r = e.getBoundingClientRect();
+        const cs = getComputedStyle(e);
+        if (r.width === 0 || r.height === 0 || cs.visibility === 'hidden' || cs.display === 'none') continue;
+        // Build a stable selector
+        let sel = '';
+        if (e.id && /^[A-Za-z][\\w-]*$/.test(e.id)) sel = '#' + e.id;
+        else if (e.getAttribute('data-testid')) sel = '[data-testid="' + e.getAttribute('data-testid') + '"]';
+        else if (e.name) sel = e.tagName.toLowerCase() + '[name="' + e.name + '"]';
+        else if (e.getAttribute('aria-label')) sel = e.tagName.toLowerCase() + '[aria-label="' + e.getAttribute('aria-label').replace(/"/g, '\\\\"') + '"]';
+        else {
+          // path-based fallback (max 4 levels)
+          const parts = [];
+          let cur = e;
+          for (let i = 0; i < 4 && cur && cur !== document.body; i++) {
+            let p = cur.tagName.toLowerCase();
+            if (cur.id && /^[A-Za-z][\\w-]*$/.test(cur.id)) { p = '#' + cur.id; parts.unshift(p); break; }
+            if (cur.className && typeof cur.className === 'string') {
+              const cls = cur.className.trim().split(/\\s+/).slice(0, 2).map(c => '.' + c).join('');
+              p += cls;
+            }
+            parts.unshift(p);
+            cur = cur.parentElement;
+          }
+          sel = parts.join(' > ');
+        }
+        out.push({
+          tag: e.tagName.toLowerCase(),
+          type: e.getAttribute('type') || null,
+          id: e.id || null,
+          name: e.name || null,
+          text: (e.innerText || e.value || e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.getAttribute('title') || '').trim().slice(0, 120),
+          href: e.href || null,
+          selector: sel,
+          rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) },
+          disabled: !!e.disabled,
+          checked: 'checked' in e ? !!e.checked : null
+        });
+        if (out.length >= 200) break;
+      }
+      return out;
+    })()`);
+  }
+
+  // 3) Accessibility tree — gives the page's semantic structure even when
+  //    the visible text is sparse (e.g. icon-only buttons, ARIA-only labels).
+  let a11y = null;
+  if (includeA11y) {
+    try {
+      await cdp(tabId, "Accessibility.enable").catch(() => {});
+      const r = await cdp(tabId, "Accessibility.getFullAXTree");
+      const lines = [];
+      for (const n of (r && r.nodes) || []) {
+        const role = (n.role && n.role.value) || "";
+        const name = (n.name && n.name.value) || "";
+        if (!name && !role) continue;
+        if (["generic", "none", "InlineTextBox", "LineBreak", "text"].includes(role)) {
+          if (name) lines.push(name.trim());
+          continue;
+        }
+        const indent = "  ".repeat(Math.min((n.depth || 0), 6));
+        lines.push(`${indent}[${role}] ${name.trim()}`.trimEnd());
+      }
+      let txt = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+      if (txt.length > maxChars) txt = txt.slice(0, maxChars) + "\n... (truncated)";
+      a11y = txt;
+    } catch (e) {
+      a11y = "(a11y tree unavailable: " + (e.message || e) + ")";
+    }
+  }
+
+  // 4) Console messages (optional — useful for debugging SPA errors)
+  let consoleMsgs = null;
+  if (includeConsole) {
+    const buf = consoleBuffer.get(tabId) || [];
+    consoleMsgs = buf.slice(-30);
+  }
+
+  return {
+    url: meta.url,
+    title: meta.title,
+    description: meta.description,
+    viewport: meta.viewport,
+    visibleText: meta.visibleText,
+    headings: meta.headings,
+    meta: meta.meta,
+    interactiveElements: forms,
+    a11yTree: a11y,
+    console: consoleMsgs,
+    // A ready-to-paste text block for LLMs that just want one string:
+    textBlock: [
+      `URL: ${meta.url}`,
+      `Title: ${meta.title}`,
+      meta.description ? `Description: ${meta.description}` : null,
+      `Viewport: ${meta.viewport.w}x${meta.viewport.h} @ (${meta.viewport.scrollX},${meta.viewport.scrollY})`,
+      "",
+      "== VISIBLE TEXT ==",
+      meta.visibleText,
+      "",
+      "== HEADINGS ==",
+      (meta.headings || []).map(h => `${'  '.repeat(h.level - 1)}H${h.level}: ${h.text}`).join("\n"),
+      "",
+      "== INTERACTIVE ELEMENTS ==",
+      (forms || []).map((e, i) => `${i + 1}. <${e.tag}${e.type ? ' type=' + e.type : ''}> "${e.text}" → ${e.selector}`).join("\n"),
+      "",
+      includeA11y ? "== ACCESSIBILITY TREE ==" : null,
+      a11y || null,
+    ].filter(x => x !== null).join("\n")
+  };
 }
 
 async function cmdQuery(tabId, args) {
@@ -480,6 +735,36 @@ async function cmdScreenshot(tabId) {
   const j = await r2.json();
   if (!j.ok) throw new Error(j.error || "screenshot upload failed");
   return j; // { ok, path, url, size }
+}
+
+// ---------- vision: screenshot + readable companion, for VLM callers ----------
+//
+// This is a *hint* command — the bridge does NOT call any vision model.
+// It just returns both the screenshot file path (already saved on disk by
+// /screenshot) AND a `readable` dump, so the agent can:
+//   1) Use the text dump with a text-only LLM (cheaper, faster)
+//   2) Use the screenshot with a VLM (GPT-4V, Claude, GLM-4V, etc.)
+//   3) Use both — pass the text as context + the image for visual grounding
+//
+// The caller is responsible for picking the model and forwarding the bytes.
+
+async function cmdVision(tabId, args) {
+  const prompt = (args && args.prompt) || "";
+  // 1) Screenshot
+  const shot = await cmdScreenshot(tabId);
+  // 2) Readable companion (reuse the existing handler)
+  const text = await cmdReadable(tabId, {
+    maxChars: (args && args.maxChars) || 20000,
+    includeA11y: args && args.includeA11y !== false,
+    includeForms: true,
+    includeConsole: false,
+  });
+  return {
+    prompt: prompt,
+    screenshot_path: shot.path,
+    screenshot_size: shot.size,
+    readable: text,
+  };
 }
 
 async function cmdKey(tabId, args) {
@@ -1153,10 +1438,12 @@ const COMMANDS = {
   url: cmdUrl,
   html: cmdHtml,
   snippet: cmdSnippet,
+  readable: cmdReadable,
   query: cmdQuery,
   click: cmdClick,
   type: cmdType,
   screenshot: cmdScreenshot,
+  vision: cmdVision,
   key: cmdKey,
   see: cmdSee,
   // v5 additions
@@ -1210,28 +1497,26 @@ async function pollOnce() {
     let payload;
     try {
       if (cmd.type === "ping") {
-        payload = { id: cmd.id, ok: true, value: { pong: true, ext: EXT_ID, attached: Array.from(attachedTabs) } };
+        const pinned = await getDesignatedTabId();
+        payload = { id: cmd.id, ok: true, value: { pong: true, ext: EXT_ID, attached: Array.from(attachedTabs), pinnedTabId: pinned } };
       } else if (cmd.type === "tabs") {
+        // List is OK to return without pinning (read-only metadata).
+        const pinned = await getDesignatedTabId();
         const tabs = await chrome.tabs.query({});
-        payload = { id: cmd.id, ok: true, value: tabs.map(t => ({ id: t.id, url: t.url, title: t.title, active: t.active, attached: attachedTabs.has(t.id) })) };
+        payload = { id: cmd.id, ok: true, value: tabs.map(t => ({ id: t.id, url: t.url, title: t.title, active: t.active, attached: attachedTabs.has(t.id), pinned: pinned === t.id })) };
       } else if (cmd.type === "active_tab") {
         const [t] = await chrome.tabs.query({ active: true, currentWindow: true });
-        payload = { id: cmd.id, ok: true, value: t ? { id: t.id, url: t.url, title: t.title, attached: attachedTabs.has(t.id) } : null };
+        const pinned = await getDesignatedTabId();
+        payload = { id: cmd.id, ok: true, value: t ? { id: t.id, url: t.url, title: t.title, attached: attachedTabs.has(t.id), pinned: pinned === t.id } : null };
       } else if (cmd.type === "attach") {
-        let t;
-        if (cmd.args && cmd.args.tabId != null) {
-          t = await chrome.tabs.get(cmd.args.tabId);
-        } else {
-          [t] = await chrome.tabs.query({ active: true, currentWindow: true });
-        }
-        if (!t) throw new Error("no tab to attach to");
-        await ensureAttached(t.id);
-        payload = { id: cmd.id, ok: true, value: { attached: true, tabId: t.id } };
+        // Even `attach` is now gated by the pinned-tab rule — you can only
+        // attach (open a CDP session on) the pinned tab.
+        const targetId = await resolveTargetTabId(cmd);
+        await ensureAttached(targetId);
+        payload = { id: cmd.id, ok: true, value: { attached: true, tabId: targetId, pinned: true } };
       } else if (cmd.type === "detach") {
-        const targetId = cmd.args && cmd.args.tabId != null
-          ? cmd.args.tabId
-          : (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
-        if (targetId != null && attachedTabs.has(targetId)) {
+        const targetId = await resolveTargetTabId(cmd);
+        if (attachedTabs.has(targetId)) {
           await chrome.debugger.detach({ tabId: targetId });
           attachedTabs.delete(targetId);
         }
@@ -1244,13 +1529,10 @@ async function pollOnce() {
       } else {
         const handler = COMMANDS[cmd.type];
         if (!handler) throw new Error("unknown command: " + cmd.type);
-        // Use cmd.args.tabId if supplied, else the active tab.
-        let targetId = cmd.args && cmd.args.tabId;
-        if (targetId == null) {
-          const [t] = await chrome.tabs.query({ active: true, currentWindow: true });
-          if (!t) throw new Error("no active tab");
-          targetId = t.id;
-        }
+        // SECURITY: every command resolves its target through resolveTargetTabId,
+        // which enforces the pinned-tab rule. No more "follow the active tab"
+        // and no more "server can override tabId".
+        const targetId = await resolveTargetTabId(cmd);
         const timeoutMs = (cmd.args && cmd.args.timeout) || 30000;
         const value = await new Promise((resolve, reject) => {
           const timer = setTimeout(() => reject(new Error("command timed out after " + timeoutMs + "ms")), timeoutMs);

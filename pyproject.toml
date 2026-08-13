@@ -1,14 +1,15 @@
 [build-system]
 requires = ["setuptools>=64", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "webbridge"
-version = "3.2.0"
-description = "Local-first browser automation bridge — AI agents drive your real Chrome/Edge via CDP"
+version = "4.0.0"
+description = "Local-first browser automation bridge — AI agents drive your real Chrome/Edge via CDP, pinned to ONE tab"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
+dependencies = []
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -23,7 +24,13 @@ classifiers = [
     "Topic :: Software Development :: Testing",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-keywords = ["browser", "automation", "cdp", "chrome", "ai-agent", "local-first"]
+keywords = ["browser", "automation", "cdp", "chrome", "ai-agent", "local-first", "llm", "vision"]
+
+[project.optional-dependencies]
+# `pip install webbridge[os]` enables the /os endpoint (OS-level mouse/keyboard via pyautogui).
+# Without it, the bridge is CDP-only (drives the browser tab; can't do native dialogs).
+os = ["pyautogui>=0.9.54"]
+dev = ["pytest>=7", "pytest-cov>=4"]
 
 [project.urls]
 Homepage = "https://github.com/lee-muriithi-kingori/agentic-web-bridge-for-browser-automation"

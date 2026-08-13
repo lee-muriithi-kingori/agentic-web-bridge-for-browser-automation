@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "WebBridge",
-  "version": "1.2.0",
-  "description": "Bridge between the agent and the active browser tab. Talks to http://127.0.0.1:9876.",
+  "version": "2.0.0",
+  "description": "Local-first browser automation bridge. Pins to ONE tab and drives it via CDP. Talks to http://127.0.0.1:9876.",
   "permissions": [
     "activeTab",
     "scripting",

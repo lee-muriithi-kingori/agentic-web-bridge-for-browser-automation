@@ -12,7 +12,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from server import Bridge, Handler, Server
+from webbridge.server import Bridge, Handler, Server
 
 
 def free_port():
@@ -27,7 +27,7 @@ def start_server(data_dir):
 
     The caller is responsible for calling server.shutdown() and thread.join().
     """
-    import server as srv_mod
+    import webbridge.server as srv_mod
 
     port = free_port()
     bridge = Bridge(data_dir)
@@ -45,7 +45,7 @@ def start_server(data_dir):
 
 def stop_server(srv, t):
     """Shut down a server started with start_server."""
-    import server as srv_mod
+    import webbridge.server as srv_mod
 
     srv.shutdown()
     t.join(timeout=2)

@@ -1,2 +1,3 @@
-"""WebBridge — local-first browser automation bridge."""
-__version__ = "3.2.0"
+from webbridge._version import __version__
+
+__all__ = ["__version__"]
