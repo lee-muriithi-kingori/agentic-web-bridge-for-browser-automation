@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <title>WebBridge</title>
     <style>
-      body { font: 13px/1.4 -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 12px 14px; width: 280px; color: #1a1a1a; }
+      body { font: 13px/1.4 -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 12px 14px; width: 300px; color: #1a1a1a; }
       h1 { font-size: 14px; margin: 0 0 6px; }
       .row { margin: 4px 0; }
       .lbl { color: #888; }
@@ -21,6 +21,7 @@
       .pinned .lbl { color: #1e40af; }
       .sep { border-top: 1px solid #eee; margin: 8px 0; }
       .hint { font-size: 11px; color: #666; margin-top: 4px; }
+      input[type="password"] { width: 100%; padding: 4px 6px; font: inherit; border: 1px solid #ccc; border-radius: 3px; box-sizing: border-box; margin-top: 4px; }
     </style>
   </head>
   <body>
@@ -29,6 +30,7 @@
     <div class="row"><span class="lbl">URL:</span> <span id="url" class="val url">…</span></div>
     <div class="row"><span class="lbl">Title:</span> <span id="title" class="val">…</span></div>
     <div class="row"><span class="lbl">Ext ID:</span> <span id="ext" class="val">…</span></div>
+    <div class="row"><span class="lbl">Auth:</span> <span id="authstatus" class="val">…</span></div>
 
     <div class="sep"></div>
 
@@ -38,6 +40,15 @@
       <button id="designate" class="primary">Pin this tab</button>
       <button id="unpin" class="danger">Unpin</button>
       <div class="hint">Only the pinned tab can be driven by agents. Other tabs are ignored.</div>
+    </div>
+
+    <div class="sep"></div>
+
+    <div id="tokenrow" style="display:none">
+      <div class="row"><span class="lbl">Token:</span></div>
+      <input type="password" id="token" placeholder="Bearer token (server has WEBBRIDGE_TOKEN set)">
+      <button id="savetoken">Save token</button>
+      <div class="hint">Token is stored in chrome.storage.local and sent on every request.</div>
     </div>
 
     <div class="sep"></div>

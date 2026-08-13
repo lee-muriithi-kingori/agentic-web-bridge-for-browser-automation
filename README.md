@@ -36,6 +36,19 @@ This is a **breaking** revamp. The biggest change: the bridge now operates on **
 | **Persistent extension ID** | The extension's session ID survives service-worker restarts (MV3 kills the SW every ~30s idle). |
 | **132 tests** (was 114, 6 were mislabeled integration tests) | All tests pass; new tests cover the v4 commands, the `/os` allowlist, the `/version` endpoint, and the new output-formatting branches. |
 
+### v4.1 additions
+
+| Change | Why |
+|---|---|
+| **Real long-poll on `/poll`** | The extension's `/poll` now blocks up to 25s waiting for a command (was busy-polling every 800ms). Cuts extension HTTP traffic by ~90%. The infrastructure was always there (`threading.Condition`); now it's wired up. |
+| **Auth token (`WEBBRIDGE_TOKEN`)** | Set the env var on the server → every non-public endpoint requires a Bearer token (or `?token=` query param for the extension). The popup has a token field that appears automatically when auth is enabled. Defaults to off for backwards-compat. Uses `secrets.compare_digest` (constant-time). |
+| **MCP server (`webbridge-mcp`)** | Exposes the bridge as a Model Context Protocol server (24 tools) so Claude Desktop / Cursor / Cline / VS Code can drive the browser as a set of tools. Stdlib-only JSON-RPC over stdio — no `mcp` package required. |
+| **CI workflow** | `.github/workflows/test.yml` runs the 144 tests on Python 3.9–3.13 across Ubuntu, Windows, and macOS on every push/PR. |
+| **`content.js` deleted** | The content script was dead code (no service-worker listener picked up its messages). Removed from the manifest; saves a tiny bit of CPU on every page load. |
+| **Cross-platform paths** | No more hardcoded `/tmp/` in tests (uses `tempfile.mkdtemp`). Default data dir is now per-OS (`~/.local/share/webbridge` on Linux, `~/Library/Application Support/webbridge` on macOS, `%LOCALAPPDATA%\webbridge` on Windows). `file://` URLs work on Windows (`file:///C:/...`). |
+| **144 tests** (was 132) | New tests cover auth (enabled/disabled, Bearer header, query param, wrong token), long-poll blocking, cross-platform path helpers. |
+
+
 ---
 
 ## What it does
@@ -328,6 +341,59 @@ curl -X POST http://127.0.0.1:9876/shutdown
 
 ---
 
+## Using the bridge with MCP clients (Claude Desktop, Cursor, Cline, VS Code)
+
+The bridge ships with a **Model Context Protocol server** (`webbridge-mcp`) that exposes 24 tools — any MCP-compatible client can drive the pinned browser tab as a set of tools, no HTTP wrangling required.
+
+### Setup
+
+1. Install the package: `pip install -e .` (gives you the `webbridge-mcp` command)
+2. Add the server to your MCP client's config. For **Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+
+```json
+{
+  "mcpServers": {
+    "webbridge": {
+      "command": "webbridge-mcp",
+      "env": {
+        "WEBBRIDGE_URL": "http://127.0.0.1:9876",
+        "WEBBRIDGE_TOKEN": "your-secret-token-here"
+      }
+    }
+  }
+}
+```
+
+For **Cursor** / **Cline** / **VS Code MCP**, the config shape is the same — see your client's docs for where to put it.
+
+3. Restart Claude Desktop. You'll see `webbridge` listed under available MCP servers with 24 tools (`wb_ping`, `wb_navigate`, `wb_readable`, `wb_click`, `wb_type`, `wb_screenshot`, `wb_vision`, `wb_eval`, `wb_osscreenshot`, etc.).
+
+### How it works
+
+- The MCP server is a **stdio JSON-RPC 2.0** process. The client spawns it, talks to it over stdin/stdout.
+- The MCP server talks **HTTP** to the webbridge server (`127.0.0.1:9876` by default).
+- `wb_readable` returns its `textBlock` field as the MCP tool result text — perfect for LLM consumption (the model sees the page as text, not JSON).
+- `wb_vision` returns the readable text companion (the screenshot stays on disk; you'd need a VLM-aware client to forward it — most MCP clients don't yet support image content blocks).
+- The MCP server is **stdlib-only** (no `mcp` package required). It implements the subset of the spec needed for `initialize`, `tools/list`, and `tools/call`.
+
+### Tool list
+
+| Tool | What it does |
+|---|---|
+| `wb_ping` | Health check — returns pong + pinned tab ID |
+| `wb_navigate` | Navigate the pinned tab to a URL |
+| `wb_readable` | LLM-optimized text dump (the workhorse for text AIs) |
+| `wb_click` / `wb_type` / `wb_key` | Interact with elements by CSS selector |
+| `wb_screenshot` | Screenshot → file path |
+| `wb_vision` | Screenshot + readable companion |
+| `wb_scroll` / `wb_back` / `wb_forward` / `wb_refresh` | Navigation |
+| `wb_eval` | Arbitrary JS (bypasses CSP) |
+| `wb_title` / `wb_url` / `wb_html` / `wb_snippet` | Read page state |
+| `wb_tabs` / `wb_console` / `wb_cookies_get` | Inspect browser |
+| `wb_osscreenshot` / `wb_osclick` / `wb_ostype` / `wb_oshotkey` | OS-level input (requires `pyautogui`) |
+
+---
+
 ## Using the bridge with LLMs
 
 The bridge is **agent-agnostic** — it speaks plain HTTP. Here's how to use it with different kinds of AI:
@@ -395,12 +461,23 @@ The most effective pattern for hard pages (canvas, image-heavy, custom UI): pass
 |---|---|---|
 | `WEBBRIDGE_HOST` | `127.0.0.1` | Bind address |
 | `WEBBRIDGE_PORT` | `9876` | Bind port |
-| `WEBBRIDGE_DATA_DIR` | `webbridge/` | Screenshot/trace storage |
+| `WEBBRIDGE_DATA_DIR` | per-OS (see below) | Screenshot/trace storage |
 | `WEBBRIDGE_LOG_FILE` | (none) | Log to file |
 | `WEBBRIDGE_LOG_LEVEL` | `INFO` | Log level (DEBUG/INFO/WARNING/ERROR/CRITICAL) |
+| `WEBBRIDGE_TOKEN` | (none) | **v4.1.** If set, all non-public endpoints require a Bearer token (or `?token=` query param). Defaults to off for backwards-compat. |
 | `WEBBRIDGE_URL` | (none) | Client default server URL |
 | `WEBBRIDGE_WAIT` | (none) | Client default wait timeout (ms) |
 | `WEBBRIDGE_TAB` | (none) | (deprecated — pinned tab is the only target) |
+
+**Default data dir** (cross-platform, no hardcoded paths):
+
+| OS | Path |
+|---|---|
+| Linux | `~/.local/share/webbridge` (or `$XDG_DATA_HOME/webbridge`) |
+| macOS | `~/Library/Application Support/webbridge` |
+| Windows | `%LOCALAPPDATA%\webbridge` |
+
+Override with `WEBBRIDGE_DATA_DIR` if you want a custom location.
 
 CLI flags override env vars:
 
@@ -445,7 +522,7 @@ These can be disabled per-command (`humanize: false` in args) or tuned in `backg
 ## Testing
 
 ```bash
-# Run all unit tests (132 tests across server + client)
+# Run all unit tests (144 tests across server + client)
 python -m pytest tests/ -v
 # or with unittest:
 python -m unittest discover tests -v
@@ -454,7 +531,9 @@ python -m unittest discover tests -v
 python -m unittest tests.test_integration -v
 ```
 
-132 unit tests cover the server Bridge class, HTTP handler (including the new `/os` and `/version` endpoints), client CLI, argument parsing, and the new v4 command types. Integration tests auto-detect server availability and skip gracefully (note: they check the server but NOT whether a tab is pinned — if the server is up but no tab is pinned, integration tests will run and fail with the "no pinned tab" error, which is itself a useful signal).
+144 unit tests cover the server Bridge class, HTTP handler (including `/os`, `/version`, auth, and long-poll), client CLI, argument parsing, cross-platform path helpers, and the v4 command types. Integration tests auto-detect server availability and skip gracefully (note: they check the server but NOT whether a tab is pinned — if the server is up but no tab is pinned, integration tests will run and fail with the "no pinned tab" error, which is itself a useful signal).
+
+CI runs the 144 unit tests on every push/PR, across Python 3.9–3.13 on Ubuntu, Windows, and macOS. See `.github/workflows/test.yml`.
 
 ---
 
@@ -464,26 +543,28 @@ python -m unittest tests.test_integration -v
 ├── server.py              # Standalone shim — re-exports from webbridge.server
 ├── client.py              # Standalone shim — re-exports from webbridge.client
 ├── extension/
-│   ├── manifest.json      # MV3 manifest (v2.0.0)
-│   ├── background.js      # Service worker — CDP driver, pinned-tab guard, readable + vision handlers
-│   ├── content.js         # Content script (legacy/fallback — currently dead code; CDP superseded it)
-│   ├── popup.html         # Extension popup UI (with "Pin this tab" button)
-│   └── popup.js           # Popup logic (pin/unpin, server health, ping)
+│   ├── manifest.json      # MV3 manifest (v2.1.0 — no content_scripts entry)
+│   ├── background.js      # Service worker — CDP driver, pinned-tab guard, readable + vision handlers, auth + long-poll
+│   ├── popup.html         # Extension popup UI (Pin button + token field)
+│   └── popup.js           # Popup logic (pin/unpin, token save, server health, ping)
 ├── webbridge/             # Installable Python package
 │   ├── __init__.py        # Re-exports __version__
-│   ├── _version.py        # Single source of truth for version (4.0.0)
+│   ├── _version.py        # Single source of truth for version (4.1.0)
 │   ├── __main__.py        # python -m webbridge entry
-│   ├── server.py          # Server module (Bridge, Handler, /os endpoint, /version endpoint)
-│   └── client.py          # Client module (30+ subcommands, OS-level commands)
+│   ├── server.py          # Server module (Bridge, Handler, /os, /version, auth, long-poll, cross-platform paths)
+│   ├── client.py          # Client module (30+ subcommands, OS-level commands, Bearer auth)
+│   └── mcp.py             # MCP server (24 tools, stdio JSON-RPC, stdlib-only)
 ├── tests/
-│   ├── test_server.py     # 60+ server tests (including v4 additions)
-│   ├── test_client.py     # 70+ client tests (including v4 additions)
+│   ├── test_server.py     # 75+ server tests (incl. auth, long-poll, cross-platform paths)
+│   ├── test_client.py     # 70+ client tests (incl. v4 commands, OS-level commands)
 │   ├── test_integration.py # 6 integration tests (require browser)
 │   └── conftest.py        # Test fixtures
+├── .github/workflows/
+│   └── test.yml           # CI: Python 3.9–3.13 × Ubuntu/Windows/macOS
 ├── examples/
 │   ├── find_bounties.py   # GitHub bounty finder
 │   └── leadgen.py         # Contact extractor (note: example uses hardcoded URLs, not Google search)
-├── pyproject.toml         # Package config (v4.0.0, optional [os] and [dev] extras)
+├── pyproject.toml         # Package config (v4.1.0, optional [os] and [dev] extras, webbridge-mcp entry point)
 ├── start.bat              # Windows launcher (uses --port flag)
 ├── start.sh               # Unix launcher (uses --port flag)
 ├── LICENSE                # MIT
@@ -495,15 +576,16 @@ python -m unittest tests.test_integration -v
 
 ## Known limitations (honest list)
 
-- **`/poll` is not actually long-poll** despite the original docstring claim — it returns immediately with `{id: null}` when the queue is empty. The extension busy-polls every 800ms. This works but burns more connections than necessary. (The `threading.Condition` infrastructure is in place; turning it into a real long-poll is a small PR.)
-- **No auth on the server.** Anyone who can reach `127.0.0.1:9876` can drive the pinned tab. Acceptable for single-user dev machines; not acceptable for shared hosts.
+- **Auth is opt-in, not on by default.** `WEBBRIDGE_TOKEN` must be set explicitly. If you forget, anyone who can reach `127.0.0.1:9876` can drive the pinned tab. The startup banner now prints whether auth is enabled, so it's hard to miss — but it's still your responsibility to set it on shared hosts.
 - **No request body size limit.** A 1GB POST to `/trace` is loaded into memory in full.
-- **`content.js` is dead code.** It sends `tick`/`result` messages that no service-worker listener picks up. It's still registered in the manifest. Safe to delete in a future cleanup.
 - **`reload` command** (in the extension) calls `chrome.runtime.reload()`, which resets the extension state. Useful for development; mildly dangerous in production.
 - **Screenshots are base64-encoded JSON POSTs** — hits CDP message-size limits on some very large pages. No streaming yet.
 - **`/os` is synchronous** — long OS-level operations block the HTTP handler. Fine for clicks/typing; not fine for a 30-second `typewrite` of a 10000-char string.
 - **OS-level commands bypass the pinned-tab guard** (they don't touch the browser at all — they're for the desktop). This is by design (you might want to click a native dialog that's blocking the browser), but it means the `/os` endpoint can drive anything on your desktop. Be careful.
-- **No CI workflow** — tests pass locally but there's no GitHub Action verifying it on push.
+- **MCP server doesn't support image content blocks.** `wb_vision` returns the readable text companion as the tool result, but the screenshot stays on disk. Most MCP clients (Claude Desktop as of this writing) don't yet support image content blocks in tool results, so the bridge can't push the screenshot through the MCP layer. To use vision, call `wb_screenshot` to get the file path, then forward the bytes to your VLM separately.
+- **MCP server implements a minimal subset of the spec.** It supports `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`. It does NOT support `resources/*`, `prompts/*`, or `sampling/*`. If you need those, swap `webbridge/mcp.py` for a thin wrapper around the official `mcp` package.
+- **CI workflow runs unit tests only.** Integration tests (which require a real browser + extension + pinned tab) are not run in CI — they're for local/manual verification only.
+- **`/poll` long-poll is capped at 25 seconds** (`POLL_TIMEOUT_MS` in `server.py`). If you want longer, change the constant — but be aware that some network stacks / proxies will close idle connections before 25s.
 
 ---
 

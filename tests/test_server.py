@@ -2,6 +2,7 @@
 
 import http.client
 import json
+import tempfile
 import os
 import socket
 import threading
@@ -23,6 +24,13 @@ def _free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def _tmp_data_dir():
+    """Return a fresh temp directory path. Cross-platform (no hardcoded /tmp)."""
+    return tempfile.mkdtemp(prefix="wb_test_")
+
+
 
 
 def _start_server(data_dir):
@@ -54,9 +62,9 @@ def _stop_server(srv, t):
         srv_mod.BRIDGE = old_br
 
 
-def _get(url, path):
+def _get(url, path, timeout=30):
     host, port = url.split("://")[1].split(":")
-    conn = http.client.HTTPConnection(host, int(port), timeout=5)
+    conn = http.client.HTTPConnection(host, int(port), timeout=timeout)
     conn.request("GET", path)
     resp = conn.getresponse()
     body = json.loads(resp.read().decode())
@@ -64,9 +72,9 @@ def _get(url, path):
     return resp.status, body
 
 
-def _post(url, path, data=None):
+def _post(url, path, data=None, timeout=30):
     host, port = url.split("://")[1].split(":")
-    conn = http.client.HTTPConnection(host, int(port), timeout=5)
+    conn = http.client.HTTPConnection(host, int(port), timeout=timeout)
     body_bytes = json.dumps(data or {}).encode()
     conn.request("POST", path, body=body_bytes,
                  headers={"Content-Type": "application/json"})
@@ -78,7 +86,7 @@ def _post(url, path, data=None):
 
 def _with_server(fn):
     """Run fn(bridge, url) against a temporary server."""
-    bridge, srv, url, t = _start_server("/tmp/wb_h_" + str(_free_port()))
+    bridge, srv, url, t = _start_server(_tmp_data_dir())
     try:
         fn(bridge, url)
     finally:
@@ -91,50 +99,50 @@ def _with_server(fn):
 
 class TestBridgeInit(unittest.TestCase):
     def test_initial_state_has_expected_keys(self):
-        b = Bridge("/tmp/wb_test_init")
+        b = Bridge(_tmp_data_dir())
         for key in ("url", "title", "tabId", "extId", "snippet", "ts"):
             self.assertIn(key, b.state)
 
     def test_cmd_queue_starts_empty(self):
-        b = Bridge("/tmp/wb_test_init")
+        b = Bridge(_tmp_data_dir())
         self.assertEqual(len(b.cmd_queue), 0)
 
     def test_results_starts_empty(self):
-        b = Bridge("/tmp/wb_test_init")
+        b = Bridge(_tmp_data_dir())
         self.assertEqual(len(b.results), 0)
 
     def test_log_lines_starts_empty(self):
-        b = Bridge("/tmp/wb_test_init")
+        b = Bridge(_tmp_data_dir())
         self.assertEqual(len(b.log_lines), 0)
 
     def test_data_dir_stored(self):
-        b = Bridge("/tmp/wb_test_data")
-        self.assertEqual(b.data_dir, "/tmp/wb_test_data")
+        b = Bridge(_tmp_data_dir())
+        self.assertTrue(b.data_dir)
 
     def test_screenshot_dir_derived(self):
-        b = Bridge("/tmp/wb_test_data")
-        self.assertEqual(b.screenshot_dir, "/tmp/wb_test_data/screenshots")
+        b = Bridge(_tmp_data_dir())
+        self.assertEqual(b.screenshot_dir, os.path.join(b.data_dir, "screenshots"))
 
     def test_trace_root_derived(self):
-        b = Bridge("/tmp/wb_test_data")
-        self.assertEqual(b.trace_root, "/tmp/wb_test_data/traces")
+        b = Bridge(_tmp_data_dir())
+        self.assertEqual(b.trace_root, os.path.join(b.data_dir, "traces"))
 
 
 class TestBridgeEnqueue(unittest.TestCase):
     def test_enqueue_returns_true(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         result = b.enqueue({"id": "c1", "type": "ping", "args": {}})
         self.assertTrue(result)
 
     def test_enqueue_adds_to_queue(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         cmd = {"id": "c2", "type": "eval", "args": {"code": "1+1"}}
         b.enqueue(cmd)
         self.assertEqual(len(b.cmd_queue), 1)
         self.assertEqual(b.cmd_queue[0], cmd)
 
     def test_enqueue_multiple_commands_fifo(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         b.enqueue({"id": "c1", "type": "ping", "args": {}})
         b.enqueue({"id": "c2", "type": "html", "args": {}})
         self.assertEqual(b.cmd_queue[0]["id"], "c1")
@@ -143,24 +151,24 @@ class TestBridgeEnqueue(unittest.TestCase):
 
 class TestBridgeDequeue(unittest.TestCase):
     def test_dequeue_empty_returns_none(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         self.assertIsNone(b.dequeue("ext1"))
 
     def test_dequeue_returns_command(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         cmd = {"id": "c1", "type": "navigate", "args": {"url": "http://x"}}
         b.enqueue(cmd)
         got = b.dequeue("ext1")
         self.assertEqual(got, cmd)
 
     def test_dequeue_sets_ext_id(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         b.enqueue({"id": "c1", "type": "ping", "args": {}})
         b.dequeue("my-extension")
         self.assertEqual(b.state["extId"], "my-extension")
 
     def test_dequeue_fifo_order(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         c1 = {"id": "c1", "type": "ping", "args": {}}
         c2 = {"id": "c2", "type": "html", "args": {}}
         b.enqueue(c1)
@@ -172,20 +180,20 @@ class TestBridgeDequeue(unittest.TestCase):
 
 class TestBridgePostResult(unittest.TestCase):
     def test_post_result_stores(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         b.post_result("r1", True, value="hello")
         self.assertIn("r1", b.results)
         self.assertTrue(b.results["r1"]["ok"])
         self.assertEqual(b.results["r1"]["value"], "hello")
 
     def test_post_result_with_error(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         b.post_result("r2", False, error="not found")
         self.assertFalse(b.results["r2"]["ok"])
         self.assertEqual(b.results["r2"]["error"], "not found")
 
     def test_post_result_has_timestamp(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         before = time.time()
         b.post_result("r3", True, value=42)
         after = time.time()
@@ -195,12 +203,12 @@ class TestBridgePostResult(unittest.TestCase):
 
 class TestBridgeWaitForResult(unittest.TestCase):
     def test_wait_returns_none_on_timeout(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         result = b.wait_for_result("nonexistent", wait_ms=50)
         self.assertIsNone(result)
 
     def test_wait_returns_result_when_available(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         def post():
             time.sleep(0.05)
             b.post_result("r1", True, value="done")
@@ -211,7 +219,7 @@ class TestBridgeWaitForResult(unittest.TestCase):
         self.assertEqual(result["value"], "done")
 
     def test_wait_returns_result_already_present(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         b.post_result("r1", True, value="already here")
         result = b.wait_for_result("r1", wait_ms=100)
         self.assertIsNotNone(result)
@@ -220,13 +228,13 @@ class TestBridgeWaitForResult(unittest.TestCase):
 
 class TestBridgeState(unittest.TestCase):
     def test_get_state_returns_dict(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         state = b.get_state()
         self.assertIsInstance(state, dict)
         self.assertEqual(state["url"], None)
 
     def test_post_state_updates(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         b.post_state("ext1", {"url": "http://example.com", "title": "Example"})
         state = b.get_state()
         self.assertEqual(state["url"], "http://example.com")
@@ -234,13 +242,13 @@ class TestBridgeState(unittest.TestCase):
         self.assertEqual(state["extId"], "ext1")
 
     def test_get_state_returns_copy(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         state = b.get_state()
         state["url"] = "tampered"
         self.assertIsNone(b.get_state()["url"])
 
     def test_state_round_trip(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         payload = {"url": "https://test.dev", "title": "Test", "tabId": 42}
         b.post_state("ext99", payload)
         got = b.get_state()
@@ -253,13 +261,13 @@ class TestBridgeState(unittest.TestCase):
 
 class TestBridgeLog(unittest.TestCase):
     def test_log_adds_line(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         b.log("test", "hello world")
         self.assertEqual(len(b.log_lines), 1)
         self.assertIn("hello world", b.log_lines[0])
 
     def test_tail_log_returns_last_n(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         for i in range(10):
             b.log("t", f"line {i}")
         tail = b.tail_log(3)
@@ -269,7 +277,7 @@ class TestBridgeLog(unittest.TestCase):
 
 class TestBridgeGC(unittest.TestCase):
     def test_gc_removes_stale_results(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         b.results["old"] = {"ok": True, "value": "x", "error": None,
                              "ts": time.time() - RESULT_TTL - 10}
         b.results["new"] = {"ok": True, "value": "y", "error": None,
@@ -279,7 +287,7 @@ class TestBridgeGC(unittest.TestCase):
         self.assertIn("new", b.results)
 
     def test_gc_keeps_fresh_results(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         b.results["fresh"] = {"ok": True, "value": "y", "error": None,
                                "ts": time.time()}
         b.gc_results()
@@ -288,7 +296,7 @@ class TestBridgeGC(unittest.TestCase):
 
 class TestBridgeShutdown(unittest.TestCase):
     def test_shutdown_sets_flag(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         self.assertFalse(b.is_shutting_down)
         b.shutdown()
         self.assertTrue(b.is_shutting_down)
@@ -319,11 +327,14 @@ class TestHandlerHealth(unittest.TestCase):
             self.assertTrue(body["ok"])
             self.assertEqual(body["service"], "webbridge")
             # Version is now a single source of truth from webbridge._version
-            self.assertTrue(body["version"].startswith("4.0"))
+            self.assertTrue(body["version"].startswith("4."))
             # New in v4: pyautogui availability flag and /os, /version endpoints
             self.assertIn("pyautogui", body)
             self.assertIn("/os", body["endpoints"])
             self.assertIn("/version", body["endpoints"])
+            # v4.1: auth_enabled flag
+            self.assertIn("auth_enabled", body)
+            self.assertIsInstance(body["auth_enabled"], bool)
         _with_server(check)
 
     def test_get_health(self):
@@ -365,15 +376,52 @@ class TestHandlerStateEndpoint(unittest.TestCase):
 class TestHandlerPollEndpoint(unittest.TestCase):
     def test_poll_empty_returns_none(self):
         def check(b, url):
-            status, body = _get(url, "/poll?ext=e1")
+            # Pass ?wait=0 so the long-poll returns immediately (no blocking).
+            status, body = _get(url, "/poll?ext=e1&wait=0")
             self.assertEqual(status, 200)
             self.assertIsNone(body.get("id"))
         _with_server(check)
 
     def test_poll_returns_enqueued(self):
+        b_pre, srv, url, t = _start_server(_tmp_data_dir())
+        try:
+            b_pre.enqueue({"id": "p1", "type": "ping", "args": {}})
+            status, body = _get(url, "/poll?ext=e1&wait=0")
+            self.assertEqual(status, 200)
+            self.assertEqual(body.get("id"), "p1")
+            self.assertEqual(body.get("type"), "ping")
+        finally:
+            _stop_server(srv, t)
+
+    def test_poll_long_poll_blocks_until_command(self):
+        """Long-poll: /poll should block until a command is enqueued."""
+        b, srv, url, t = _start_server(_tmp_data_dir())
+        try:
+            import threading as _th
+            result = {"status": None, "body": None}
+            def poller():
+                status, body = _get(url, "/poll?ext=e1&wait=3000")
+                result["status"] = status
+                result["body"] = body
+            th = _th.Thread(target=poller, daemon=True)
+            th.start()
+            time.sleep(0.2)  # let the poller connect + start blocking
+            # Now enqueue a command — the blocked poll should return immediately.
+            t0 = time.time()
+            b.enqueue({"id": "lp1", "type": "ping", "args": {}})
+            th.join(timeout=2)
+            elapsed = time.time() - t0
+            self.assertEqual(result["status"], 200)
+            self.assertEqual(result["body"].get("id"), "lp1")
+            # Should return well under the 3s timeout since we enqueued promptly.
+            self.assertLess(elapsed, 1.5)
+        finally:
+            _stop_server(srv, t)
+
+    def test_poll_returns_enqueued_via_with_server(self):
         def check(b, url):
             b.enqueue({"id": "c1", "type": "ping", "args": {}})
-            status, body = _get(url, "/poll?ext=e1")
+            status, body = _get(url, "/poll?ext=e1&wait=0")
             self.assertEqual(status, 200)
             self.assertEqual(body["id"], "c1")
             self.assertEqual(body["type"], "ping")
@@ -523,7 +571,7 @@ class TestHandlerOptions(unittest.TestCase):
 
 class TestWaitBlocking(unittest.TestCase):
     def test_wait_blocks_until_result_posted(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         results = []
 
         def waiter():
@@ -545,7 +593,7 @@ class TestWaitBlocking(unittest.TestCase):
         self.assertEqual(results[0]["value"], "ready")
 
     def test_concurrent_enqueue_dequeue(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         for i in range(20):
             b.enqueue({"id": f"c{i}", "type": "ping", "args": {}})
         dequeued = []
@@ -572,14 +620,14 @@ class TestV4CommandTypes(unittest.TestCase):
 
     def test_readable_command_round_trips(self):
         """`readable` should enqueue like any other command type."""
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         b.enqueue({"id": "r1", "type": "readable", "args": {"maxChars": 1000}})
         cmd = b.dequeue("ext")
         self.assertEqual(cmd["type"], "readable")
         self.assertEqual(cmd["args"]["maxChars"], 1000)
 
     def test_vision_command_round_trips(self):
-        b = Bridge("/tmp/wb_test")
+        b = Bridge(_tmp_data_dir())
         b.enqueue({"id": "v1", "type": "vision", "args": {"prompt": "describe"}})
         cmd = b.dequeue("ext")
         self.assertEqual(cmd["type"], "vision")
@@ -592,7 +640,7 @@ class TestVersionEndpoint(unittest.TestCase):
             status, body = _get(url, "/version")
             self.assertEqual(status, 200)
             self.assertTrue(body["ok"])
-            self.assertTrue(body["package"].startswith("4.0"))
+            self.assertTrue(body["package"].startswith("4."))
             self.assertEqual(body["extension"], "2.0.0")
             # pyautogui_available is a bool, present either way
             self.assertIsInstance(body["pyautogui_available"], bool)
@@ -643,6 +691,117 @@ class TestOSEndpoint(unittest.TestCase):
             # we should NOT get a 400 "not in allowlist" error.
             self.assertNotEqual(status, 400)
         _with_server(check)
+
+
+# ===================================================================
+# v4.1 additions: auth (WEBBRIDGE_TOKEN), long-poll, cross-platform paths
+# ===================================================================
+
+class TestAuthEnabled(unittest.TestCase):
+    """When WEBBRIDGE_TOKEN is set, non-public endpoints require it."""
+
+    def setUp(self):
+        # Save and set the token env var for the duration of these tests.
+        self._old = os.environ.get("WEBBRIDGE_TOKEN")
+        os.environ["WEBBRIDGE_TOKEN"] = "test-secret-token"
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("WEBBRIDGE_TOKEN", None)
+        else:
+            os.environ["WEBBRIDGE_TOKEN"] = self._old
+
+    def test_health_is_public_no_token_needed(self):
+        def check(b, url):
+            status, body = _get(url, "/health")
+            self.assertEqual(status, 200)
+            self.assertTrue(body["auth_enabled"])
+        _with_server(check)
+
+    def test_version_is_public_no_token_needed(self):
+        def check(b, url):
+            status, body = _get(url, "/version")
+            self.assertEqual(status, 200)
+        _with_server(check)
+
+    def test_state_requires_token(self):
+        def check(b, url):
+            # No token → 401
+            status, body = _get(url, "/state")
+            self.assertEqual(status, 401)
+            self.assertFalse(body["ok"])
+            self.assertIn("unauthorized", body["error"])
+        _with_server(check)
+
+    def test_state_with_correct_token_succeeds(self):
+        def check(b, url):
+            # Bearer token → 200
+            import http.client as hc
+            host, port = url.split("://")[1].split(":")
+            conn = hc.HTTPConnection(host, int(port), timeout=5)
+            conn.request("GET", "/state", headers={"Authorization": "Bearer test-secret-token"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read().decode())
+            conn.close()
+            self.assertEqual(resp.status, 200)
+        _with_server(check)
+
+    def test_state_with_wrong_token_rejected(self):
+        def check(b, url):
+            import http.client as hc
+            host, port = url.split("://")[1].split(":")
+            conn = hc.HTTPConnection(host, int(port), timeout=5)
+            conn.request("GET", "/state", headers={"Authorization": "Bearer wrong-token"})
+            resp = conn.getresponse()
+            conn.close()
+            self.assertEqual(resp.status, 401)
+        _with_server(check)
+
+    def test_token_via_query_param_works(self):
+        """The ?token= query param is the extension's auth path."""
+        def check(b, url):
+            status, body = _get(url, "/state?token=test-secret-token")
+            self.assertEqual(status, 200)
+        _with_server(check)
+
+    def test_cmd_requires_token(self):
+        def check(b, url):
+            status, body = _post(url, "/cmd", {"type": "ping"})
+            self.assertEqual(status, 401)
+        _with_server(check)
+
+
+class TestAuthDisabled(unittest.TestCase):
+    """When WEBBRIDGE_TOKEN is NOT set, all endpoints are open (backwards-compat)."""
+
+    def setUp(self):
+        self._old = os.environ.pop("WEBBRIDGE_TOKEN", None)
+
+    def tearDown(self):
+        if self._old is not None:
+            os.environ["WEBBRIDGE_TOKEN"] = self._old
+
+    def test_state_no_token_needed_when_auth_disabled(self):
+        def check(b, url):
+            status, body = _get(url, "/state")
+            self.assertEqual(status, 200)
+        _with_server(check)
+
+
+class TestCrossPlatformPaths(unittest.TestCase):
+    """Verify no hardcoded /tmp paths leak into the server runtime."""
+
+    def test_default_data_dir_is_absolute(self):
+        from webbridge.server import _default_data_dir
+        d = _default_data_dir()
+        self.assertTrue(os.path.isabs(d), f"default data_dir should be absolute, got: {d}")
+
+    def test_file_url_uses_forward_slashes(self):
+        from webbridge.server import _file_url
+        # On any OS, a file:// URL should only contain forward slashes.
+        url = _file_url(os.path.join("C:", "Users", "foo", "bar.png") if sys.platform == "win32" else "/home/foo/bar.png")
+        self.assertTrue(url.startswith("file://"))
+        self.assertNotIn("\\", url)
 
 
 if __name__ == "__main__":

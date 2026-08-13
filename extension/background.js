@@ -11,6 +11,7 @@
 
 const SERVER = "http://127.0.0.1:9876";
 const POLL_MS = 800;
+const POLL_WAIT_MS = 25000;  // server long-poll duration (must match POLL_TIMEOUT_MS in server.py)
 
 // Persist a stable extension id across service-worker restarts.
 // (MV3 kills the SW after ~30s idle, which used to regenerate EXT_ID and
@@ -24,6 +25,23 @@ chrome.storage.local.get(["extId"]).then(({ extId }) => {
     chrome.storage.local.set({ extId: EXT_ID });
   }
 });
+
+// Auth token — read from storage on every fetch (so the user can set it
+// from the popup without restarting the SW). When empty, no Authorization
+// header is sent (server treats this as 'auth disabled').
+async function getToken() {
+  const { token } = await chrome.storage.local.get("token");
+  return token || "";
+}
+
+// Build a URL with optional ?token= query param for endpoints that can't
+// easily set headers (none currently, but kept for future use).
+async function authHeaders() {
+  const token = await getToken();
+  const h = { "Content-Type": "application/json" };
+  if (token) h["Authorization"] = "Bearer " + token;
+  return h;
+}
 
 const knownTabs = new Map();
 let activeTabId = null;
@@ -729,7 +747,7 @@ async function cmdScreenshot(tabId) {
   // r.data is base64-encoded PNG.
   const r2 = await fetch(SERVER + "/screenshot", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: await authHeaders(),
     body: JSON.stringify({ tabId, png_b64: r.data }),
   });
   const j = await r2.json();
@@ -1475,7 +1493,7 @@ async function postState() {
     const known = knownTabs.get(tab.id);
     await fetch(SERVER + "/state", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: await authHeaders(),
       body: JSON.stringify({
         ext: EXT_ID,
         url: tab.url,
@@ -1490,7 +1508,13 @@ async function postState() {
 
 async function pollOnce() {
   try {
-    const r = await fetch(SERVER + "/poll?ext=" + encodeURIComponent(EXT_ID));
+    // Long-poll: server blocks up to POLL_WAIT_MS waiting for a command.
+    // We add a small client-side margin so the HTTP timeout fires after
+    // the server's, not before.
+    const token = await getToken();
+    const url = SERVER + "/poll?ext=" + encodeURIComponent(EXT_ID) + "&wait=" + POLL_WAIT_MS
+      + (token ? "&token=" + encodeURIComponent(token) : "");
+    const r = await fetch(url, { signal: AbortSignal.timeout(POLL_WAIT_MS + 5000) });
     if (!r.ok) return;
     const cmd = await r.json();
     if (!cmd || !cmd.id) return;
@@ -1548,7 +1572,7 @@ async function pollOnce() {
     }
     await fetch(SERVER + "/result", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: await authHeaders(),
       body: JSON.stringify(payload),
     });
   } catch (_) {}

@@ -49,6 +49,7 @@ def _load_config(cli_config_path=None):
         "server": DEFAULT_SERVER,
         "tab": None,
         "wait": 15000,
+        "token": None,
     }
     for path in [os.path.expanduser("~/.webbridge"), ".webbridge"]:
         if os.path.isfile(path):
@@ -76,6 +77,8 @@ def _load_config(cli_config_path=None):
             cfg["wait"] = int(os.environ["WEBBRIDGE_WAIT"])
         except ValueError:
             pass
+    if os.environ.get("WEBBRIDGE_TOKEN"):
+        cfg["token"] = os.environ["WEBBRIDGE_TOKEN"]
     return cfg
 
 
@@ -107,34 +110,46 @@ class BridgeError(Exception):
         self.status = status
 
 
-def _http_post(server, path, body, timeout=30):
+def _http_post(server, path, body, timeout=30, token=None):
     data = json.dumps(body).encode("utf-8")
     url = server.rstrip("/") + path
-    req = urllib.request.Request(
-        url, data=data, method="POST",
-        headers={"Content-Type": "application/json"},
-    )
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         raise BridgeError(f"Connection failed: {exc.reason}") from exc
     except urllib.error.HTTPError as exc:
-        raise BridgeError(f"HTTP {exc.code}: {exc.reason}", status=exc.code) from exc
+        # Read the body so the caller can see the error message (e.g. 'unauthorized')
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = exc.reason
+        raise BridgeError(f"HTTP {exc.code}: {err_body}", status=exc.code) from exc
 
 
-def _http_get(server, path, timeout=30):
+def _http_get(server, path, timeout=30, token=None):
     url = server.rstrip("/") + path
+    req = urllib.request.Request(url)
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         raise BridgeError(f"Connection failed: {exc.reason}") from exc
     except urllib.error.HTTPError as exc:
-        raise BridgeError(f"HTTP {exc.code}: {exc.reason}", status=exc.code) from exc
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = exc.reason
+        raise BridgeError(f"HTTP {exc.code}: {err_body}", status=exc.code) from exc
 
 
-def send_command(server, cmd_type, args=None, tab_id=None, wait_ms=15000):
+def send_command(server, cmd_type, args=None, tab_id=None, wait_ms=15000, token=None):
     """Two-phase: POST /cmd to enqueue, then GET /result?id=&wait= to block."""
     # Use UUID for cid — the old "cli-<millis>" scheme collided when a
     # script issued >1 command per millisecond.
@@ -144,8 +159,8 @@ def send_command(server, cmd_type, args=None, tab_id=None, wait_ms=15000):
         body["tabId"] = tab_id
     # HTTP timeout must be >= server wait so the long-poll can actually return.
     http_timeout = max(30, (wait_ms / 1000.0) + 5.0)
-    _http_post(server, "/cmd", body, timeout=http_timeout)
-    res = _http_get(server, f"/result?id={cid}&wait={wait_ms}", timeout=http_timeout)
+    _http_post(server, "/cmd", body, timeout=http_timeout, token=token)
+    res = _http_get(server, f"/result?id={cid}&wait={wait_ms}", timeout=http_timeout, token=token)
     if not res.get("ok"):
         return res
     r = res.get("result") or {}
@@ -154,9 +169,9 @@ def send_command(server, cmd_type, args=None, tab_id=None, wait_ms=15000):
     return {"ok": False, "error": r.get("error")}
 
 
-def _os_command(server, action, args=None, timeout=30):
+def _os_command(server, action, args=None, timeout=30, token=None):
     """Synchronous /os endpoint — no queue round-trip."""
-    return _http_post(server, "/os", {"action": action, "args": args or {}}, timeout=timeout)
+    return _http_post(server, "/os", {"action": action, "args": args or {}}, timeout=timeout, token=token)
 
 
 # ---------------------------------------------------------------------------
@@ -255,33 +270,33 @@ def _print_error(msg):
 # ---------------------------------------------------------------------------
 
 def cmd_ping(args, cfg):
-    return send_command(cfg["server"], "ping", wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "ping", wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_tabs(args, cfg):
     # FIX: previously did GET /tabs which isn't a route. Go through /cmd.
-    return send_command(cfg["server"], "tabs", wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "tabs", wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_active_tab(args, cfg):
     # FIX: previously sent "activeTab" (camelCase) which the server rejected.
-    return send_command(cfg["server"], "active_tab", wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "active_tab", wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_title(args, cfg):
-    return send_command(cfg["server"], "title", wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "title", wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_url(args, cfg):
-    return send_command(cfg["server"], "url", wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "url", wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_html(args, cfg):
-    return send_command(cfg["server"], "html", wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "html", wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_snippet(args, cfg):
-    return send_command(cfg["server"], "snippet", wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "snippet", wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_readable(args, cfg):
@@ -294,46 +309,46 @@ def cmd_readable(args, cfg):
         body["includeForms"] = False
     if args.console:
         body["includeConsole"] = True
-    return send_command(cfg["server"], "readable", body, wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "readable", body, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_eval(args, cfg):
-    return send_command(cfg["server"], "eval", {"code": args.code}, wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "eval", {"code": args.code}, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_navigate(args, cfg):
-    return send_command(cfg["server"], "navigate", {"url": args.url}, wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "navigate", {"url": args.url}, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_click(args, cfg):
-    return send_command(cfg["server"], "click", {"selector": args.selector}, wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "click", {"selector": args.selector}, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_type(args, cfg):
     return send_command(cfg["server"], "type",
-                        {"selector": args.selector, "text": args.text}, wait_ms=cfg["wait"])
+                        {"selector": args.selector, "text": args.text}, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_key(args, cfg):
-    return send_command(cfg["server"], "key", {"key": args.key}, wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "key", {"key": args.key}, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_hover(args, cfg):
-    return send_command(cfg["server"], "hover", {"selector": args.selector}, wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "hover", {"selector": args.selector}, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_drag(args, cfg):
     return send_command(cfg["server"], "drag",
-                        {"from": args.from_sel, "to": args.to_sel}, wait_ms=cfg["wait"])
+                        {"from": args.from_sel, "to": args.to_sel}, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_select(args, cfg):
     return send_command(cfg["server"], "select",
-                        {"selector": args.selector, "value": args.value}, wait_ms=cfg["wait"])
+                        {"selector": args.selector, "value": args.value}, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_screenshot(args, cfg):
-    return send_command(cfg["server"], "screenshot", wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "screenshot", wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_vision(args, cfg):
@@ -347,23 +362,23 @@ def cmd_vision(args, cfg):
     body = {"prompt": args.prompt or ""}
     if args.include_a11y:
         body["includeA11y"] = True
-    return send_command(cfg["server"], "vision", body, wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "vision", body, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_scroll(args, cfg):
-    return send_command(cfg["server"], "scroll", {"direction": args.direction}, wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "scroll", {"direction": args.direction}, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_back(args, cfg):
-    return send_command(cfg["server"], "back", wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "back", wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_forward(args, cfg):
-    return send_command(cfg["server"], "forward", wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "forward", wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_refresh(args, cfg):
-    return send_command(cfg["server"], "refresh", {"hard": args.hard}, wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "refresh", {"hard": args.hard}, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_cookies(args, cfg):
@@ -376,16 +391,16 @@ def cmd_cookies(args, cfg):
             return {"ok": False, "error": f"invalid JSON for cookies set: {e}"}
     elif sub == "delete" and args.cookie_data:
         body["name"] = args.cookie_data
-    return send_command(cfg["server"], "cookies", body, wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "cookies", body, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_upload(args, cfg):
     return send_command(cfg["server"], "upload",
-                        {"selector": args.selector, "files": args.files}, wait_ms=cfg["wait"])
+                        {"selector": args.selector, "files": args.files}, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_trace(args, cfg):
-    return send_command(cfg["server"], "trace", wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "trace", wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 def cmd_tabs_focus(args, cfg):
@@ -409,7 +424,7 @@ def cmd_log(args, cfg):
     body = {}
     if args.count:
         body["count"] = args.count
-    return send_command(cfg["server"], "console", body, wait_ms=cfg["wait"])
+    return send_command(cfg["server"], "console", body, wait_ms=cfg["wait"], token=cfg.get("token"))
 
 
 # --- OS-level commands (pyautogui hybrid mode) ---
@@ -419,35 +434,35 @@ def cmd_osclick(args, cfg):
         "x": args.x, "y": args.y, "button": "left",
     } if args.button == "click" else {
         "x": args.x, "y": args.y,
-    })
+    }, token=cfg.get("token"))
 
 
 def cmd_ostype(args, cfg):
-    return _os_command(cfg["server"], "typewrite", {"text": args.text, "interval": args.interval})
+    return _os_command(cfg["server"], "typewrite", {"text": args.text, "interval": args.interval}, token=cfg.get("token"))
 
 
 def cmd_osshot(args, cfg):
-    return _os_command(cfg["server"], "screenshot", timeout=15)
+    return _os_command(cfg["server"], "screenshot", timeout=15, token=cfg.get("token"))
 
 
 def cmd_oshotkey(args, cfg):
-    return _os_command(cfg["server"], "hotkey", {"keys": args.keys})
+    return _os_command(cfg["server"], "hotkey", {"keys": args.keys}, token=cfg.get("token"))
 
 
 def cmd_osmove(args, cfg):
-    return _os_command(cfg["server"], "moveTo", {"x": args.x, "y": args.y, "duration": args.duration})
+    return _os_command(cfg["server"], "moveTo", {"x": args.x, "y": args.y, "duration": args.duration}, token=cfg.get("token"))
 
 
 def cmd_ospress(args, cfg):
-    return _os_command(cfg["server"], "press", {"key": args.key})
+    return _os_command(cfg["server"], "press", {"key": args.key}, token=cfg.get("token"))
 
 
 def cmd_ossize(args, cfg):
-    return _os_command(cfg["server"], "size", {})
+    return _os_command(cfg["server"], "size", {}, token=cfg.get("token"))
 
 
 def cmd_osposition(args, cfg):
-    return _os_command(cfg["server"], "position", {})
+    return _os_command(cfg["server"], "position", {}, token=cfg.get("token"))
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +477,7 @@ def build_parser():
     p.add_argument("--server", help=f"Server URL (default: $WEBBRIDGE_URL or {DEFAULT_SERVER})")
     p.add_argument("--tab", dest="tab_id", help="Target tab by ID (NOTE: bridge now operates on pinned tab only)")
     p.add_argument("--wait", type=int, help="Result wait timeout in ms (default: 15000)")
+    p.add_argument("--token", help="Bearer token for auth (default: $WEBBRIDGE_TOKEN or config file)")
     p.add_argument("--json", dest="raw_json", action="store_true", help="Output raw JSON")
     p.add_argument("--quiet", action="store_true", help="Suppress info, only output result")
     p.add_argument("--config", help="Path to config file")
@@ -616,6 +632,8 @@ def main():
         cfg["tab_id"] = args.tab_id
     if getattr(args, "wait", None) is not None:
         cfg["wait"] = args.wait
+    if getattr(args, "token", None):
+        cfg["token"] = args.token
 
     raw_json = getattr(args, "raw_json", False)
     quiet = getattr(args, "quiet", False)

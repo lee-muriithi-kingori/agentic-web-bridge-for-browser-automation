@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "webbridge"
-version = "4.0.0"
-description = "Local-first browser automation bridge — AI agents drive your real Chrome/Edge via CDP, pinned to ONE tab"
+version = "4.1.0"
+description = "Local-first browser automation bridge — AI agents drive your real Chrome/Edge via CDP, pinned to ONE tab. Auth, long-poll, MCP server, OS-level input."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
@@ -40,6 +40,7 @@ Repository = "https://github.com/lee-muriithi-kingori/agentic-web-bridge-for-bro
 webbridge = "webbridge.__main__:main"
 webbridge-server = "webbridge.server:main"
 webbridge-client = "webbridge.client:main"
+webbridge-mcp = "webbridge.mcp:main"
 
 [tool.setuptools.packages.find]
 include = ["webbridge*"]

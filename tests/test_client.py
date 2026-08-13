@@ -62,9 +62,11 @@ class TestHttpGet(unittest.TestCase):
         mock_urlopen.return_value = _make_response({"url": "http://x"})
         result = client._http_get("http://127.0.0.1:9876", "/state")
         self.assertEqual(result["url"], "http://x")
-        # GET passes the URL string directly to urlopen
-        url_arg = mock_urlopen.call_args[0][0]
-        self.assertIn("/state", url_arg)
+        # GET now passes a Request object to urlopen (so it can set Authorization header).
+        req_arg = mock_urlopen.call_args[0][0]
+        # Request objects expose the URL via .full_url or .get_full_url().
+        url = getattr(req_arg, "full_url", None) or req_arg.get_full_url()
+        self.assertIn("/state", url)
 
     @patch("urllib.request.urlopen")
     def test_get_connection_error_raises_bridge_error(self, mock_urlopen):

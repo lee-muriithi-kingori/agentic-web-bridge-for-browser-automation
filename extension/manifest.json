@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "WebBridge",
-  "version": "2.0.0",
-  "description": "Local-first browser automation bridge. Pins to ONE tab and drives it via CDP. Talks to http://127.0.0.1:9876.",
+  "version": "2.1.0",
+  "description": "Local-first browser automation bridge. Pins to ONE tab and drives it via CDP. Auth + long-poll. Talks to http://127.0.0.1:9876.",
   "permissions": [
     "activeTab",
     "scripting",
@@ -16,14 +16,6 @@
   "background": {
     "service_worker": "background.js"
   },
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "run_at": "document_idle",
-      "all_frames": false
-    }
-  ],
   "action": {
     "default_popup": "popup.html",
     "default_title": "WebBridge"

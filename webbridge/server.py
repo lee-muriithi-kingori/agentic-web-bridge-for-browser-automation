@@ -34,13 +34,16 @@ import http.server
 import json
 import logging
 import os
+import secrets
 import signal
 import socketserver
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from collections import deque
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -53,7 +56,7 @@ except Exception:  # pragma: no cover
 try:
     from webbridge._version import __version__ as _PKG_VERSION  # type: ignore
 except Exception:  # pragma: no cover
-    _PKG_VERSION = "4.0.0"
+    _PKG_VERSION = "4.1.0"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -61,6 +64,7 @@ except Exception:  # pragma: no cover
 
 LOG_MAX: int = 300
 RESULT_TTL: int = 300  # seconds
+POLL_TIMEOUT_MS: int = 25000  # how long /poll will block waiting for a command
 COMMAND_TYPES: list[str] = [
     "ping", "tabs", "active_tab", "attach", "detach", "reload",
     "navigate", "eval", "click", "type", "key", "scroll",
@@ -72,6 +76,53 @@ COMMAND_TYPES: list[str] = [
     # caller, but having explicit types lets agents auto-discover them).
     "vision",
 ]
+
+# Endpoints that DON'T require auth. /health and /version are public so the
+# popup can show status before the user has set a token. Everything else
+# (including /poll, /cmd, /result, /state, /screenshot, /trace, /os, /shutdown)
+# requires the bearer token when WEBBRIDGE_TOKEN is set.
+PUBLIC_ENDPOINTS: frozenset[str] = frozenset({"/", "/health", "/version"})
+
+
+def _default_data_dir() -> str:
+    """Return a sensible cross-platform default for the data directory.
+
+    Respects WEBBRIDGE_DATA_DIR if set. Otherwise uses a per-user dir:
+      - Linux:   ~/.local/share/webbridge
+      - macOS:   ~/Library/Application Support/webbridge
+      - Windows: %LOCALAPPDATA%\\webbridge
+    Falls back to ./webbridge if HOME/LOCALAPPDATA can't be resolved.
+    """
+    env = os.environ.get("WEBBRIDGE_DATA_DIR")
+    if env:
+        return env
+    # Cross-platform app-data dir without a third-party dependency.
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "webbridge")
+    if sys.platform == "darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "webbridge")
+    # linux / other unix
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return os.path.join(xdg, "webbridge")
+    return os.path.join(os.path.expanduser("~"), ".local", "share", "webbridge")
+
+
+def _file_url(path: str) -> str:
+    """Convert an absolute filesystem path to a file:// URL cross-platform.
+
+    On Windows, `C:\\Users\\foo\\bar.png` → `file:///C:/Users/foo/bar.png`.
+    On Unix, `/home/foo/bar.png` → `file:///home/foo/bar.png`.
+    """
+    # os.path.normpath cleans up any mixed separators, then we convert to
+    # forward slashes for the URL. The `file:///` prefix with three slashes
+    # is correct on both platforms (Windows gets an extra slash for the
+    # drive letter, producing file:///C:/...).
+    norm = os.path.normpath(path)
+    if sys.platform == "win32":
+        return "file:///" + norm.replace("\\", "/")
+    return "file://" + norm
 
 # ---------------------------------------------------------------------------
 # Logger setup
@@ -137,14 +188,26 @@ class Bridge:
             self.cond.notify_all()
             return True
 
-    def dequeue(self, ext_id: str) -> Optional[dict[str, Any]]:
-        """Pop and return the next command, or ``None`` if the queue is empty."""
+    def dequeue(self, ext_id: str, timeout_ms: int = 0) -> Optional[dict[str, Any]]:
+        """Pop the next command, optionally blocking up to *timeout_ms* for one.
+
+        With ``timeout_ms=0`` (default) this is non-blocking — returns None
+        immediately if the queue is empty. With ``timeout_ms>0`` it blocks on
+        the condition variable until either a command arrives or the timeout
+        elapses, which lets /poll be a REAL long-poll instead of a busy-poll.
+        """
+        deadline = time.time() + (timeout_ms / 1000.0)
         with self.cond:
             self.state["extId"] = ext_id
-            if not self.cmd_queue:
-                return None
-            cmd = self.cmd_queue.popleft()
-            return cmd
+            while True:
+                if self.cmd_queue:
+                    return self.cmd_queue.popleft()
+                if self._shutting_down:
+                    return None
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return None
+                self.cond.wait(timeout=remaining)
 
     def post_result(self, rid: str, ok: bool, value: Any = None, error: Optional[str] = None) -> None:
         """Store a result for a previously submitted command."""
@@ -235,13 +298,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # CORS — allow any origin for extension service-worker contexts
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
             self.wfile.flush()
         except Exception as exc:
             logger.warning("send failed: %s", exc)
+
+    def _check_auth(self) -> bool:
+        """Return True if the request is authorised (or auth is disabled).
+
+        Auth is disabled when WEBBRIDGE_TOKEN is not set (the default — keeps
+        the bridge backwards-compatible for single-user dev machines). When
+        the token IS set, every non-public endpoint must present it as a
+        Bearer token in the Authorization header OR as a ?token= query param
+        (query param is for the extension, which can't easily set headers
+        on every fetch in MV3 — actually it can, but query is friendlier).
+        """
+        token = os.environ.get("WEBBRIDGE_TOKEN")
+        if not token:
+            return True  # auth disabled
+        # Bearer header
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            presented = auth[len("Bearer "):].strip()
+            if secrets.compare_digest(presented, token):
+                return True
+        # Query param fallback (for extension / browser fetches)
+        q = parse_qs(urlparse(self.path).query)
+        qs_token = q.get("token", [None])[0]
+        if qs_token and secrets.compare_digest(qs_token, token):
+            return True
+        return False
+
+    def _unauthorized(self) -> None:
+        self._send_json(401, {"ok": False, "error": "unauthorized — set WEBBRIDGE_TOKEN on the server and pass it as a Bearer token or ?token= param"})
 
     def _read_json(self) -> dict[str, Any]:
         """Read the request body as JSON. Returns ``{}`` on empty body or parse errors."""
@@ -270,10 +362,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             p = u.path
 
+            # Auth: public endpoints skip the check; everything else requires it.
+            if p not in PUBLIC_ENDPOINTS and not self._check_auth():
+                return self._unauthorized()
+
             if p == "/" or p == "/health":
                 return self._send_json(200, {
                     "ok": True, "service": "webbridge", "version": _PKG_VERSION,
                     "pyautogui": pyautogui is not None,
+                    "auth_enabled": bool(os.environ.get("WEBBRIDGE_TOKEN")),
                     "endpoints": [
                         "/state", "/poll", "/cmd", "/result", "/log",
                         "/commands", "/screenshot", "/trace", "/shutdown",
@@ -298,8 +395,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             if p == "/poll":
                 ext_id = q.get("ext", ["anon"])[0]
+                # Real long-poll: block up to POLL_TIMEOUT_MS waiting for a
+                # command. The client (extension) can pass ?wait=ms to override.
+                wait_ms = int(q.get("wait", [str(POLL_TIMEOUT_MS)])[0])
+                wait_ms = max(0, min(wait_ms, POLL_TIMEOUT_MS))
                 BRIDGE.gc_results()
-                cmd = BRIDGE.dequeue(ext_id)
+                cmd = BRIDGE.dequeue(ext_id, timeout_ms=wait_ms)
                 if not cmd:
                     return self._send_json(200, {"id": None})
                 return self._send_json(200, cmd)
@@ -337,6 +438,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             u = urlparse(self.path)
             body = self._read_json()
             p = u.path
+
+            # Auth: every POST endpoint requires the token when auth is enabled.
+            if not self._check_auth():
+                return self._unauthorized()
 
             if p == "/cmd":
                 if "__parse_error__" in body:
@@ -383,7 +488,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(200, {
                     "ok": True,
                     "path": fpath,
-                    "url": "file:///" + fpath.replace("\\", "/"),
+                    "url": _file_url(fpath),
                     "size": os.path.getsize(fpath),
                 })
 
@@ -439,7 +544,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(200, {
                     "ok": True,
                     "dir": trace_dir,
-                    "url": "file:///" + trace_dir.replace("\\", "/"),
+                    "url": _file_url(trace_dir),
                     "files": files,
                 })
 
@@ -490,7 +595,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         fpath = os.path.join(BRIDGE.screenshot_dir, f"os-shot-{ts}-{uuid.uuid4().hex[:6]}.png")
                         with open(fpath, "wb") as f:
                             f.write(base64.b64decode(b64))
-                        result: Any = {"path": fpath, "png_b64": b64, "size": img.size}
+                        result: Any = {"path": fpath, "url": _file_url(fpath), "png_b64": b64, "size": img.size}
                     elif action in ("size", "position"):
                         result = tuple(fn())
                     else:
@@ -566,7 +671,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
     setup_logging(args.log_level, args.log_file)
 
-    data_dir = os.environ.get("WEBBRIDGE_DATA_DIR", "webbridge/")
+    data_dir = _default_data_dir()
     global BRIDGE  # noqa: PLW0603
     BRIDGE = Bridge(data_dir)
 
@@ -574,7 +679,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     signal.signal(signal.SIGTERM, _signal_handler)
 
     srv = Server((args.host, args.port), Handler)
-    BRIDGE.log("server", f"webbridge v4 listening on http://{args.host}:{args.port}")
+
+    # Print a clear startup banner with the data dir + auth status.
+    auth_enabled = bool(os.environ.get("WEBBRIDGE_TOKEN"))
+    BRIDGE.log("server", f"webbridge v{_PKG_VERSION} listening on http://{args.host}:{args.port}")
+    BRIDGE.log("server", f"data_dir: {data_dir}")
+    BRIDGE.log("server", f"auth: {'ENABLED (WEBBRIDGE_TOKEN set)' if auth_enabled else 'DISABLED (set WEBBRIDGE_TOKEN to enable)'}")
+    BRIDGE.log("server", f"pyautogui: {'available' if pyautogui else 'not installed (pip install webbridge[os])'}")
 
     try:
         srv.serve_forever()
