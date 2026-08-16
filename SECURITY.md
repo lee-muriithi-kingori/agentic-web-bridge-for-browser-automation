@@ -20,6 +20,7 @@ This is a feature, not a bug — the whole point is to give your local AI agent 
 | No way to say "this tab only, not that one" | Popup has a **"Pin this tab"** button; the pin is persisted in `chrome.storage.local` |
 | Extension ID regenerated on every service-worker restart (server got confused about which extension was connected) | Extension ID is **persisted** across SW restarts |
 | `attach` command could attach to any tab | `attach` is **gated** by the pinned-tab rule — it can only attach to the pinned tab |
+| CORS replied `Access-Control-Allow-Origin: *` — any webpage open in the browser could `fetch()` the bridge | CORS now only allows `chrome-extension://` / `moz-extension://` origins (or hosts explicitly added via `WEBBRIDGE_EXTRA_ORIGINS`) |
 
 ## Reporting a vulnerability
 

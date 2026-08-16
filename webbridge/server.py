@@ -86,6 +86,31 @@ COMMAND_TYPES: list[str] = [
 # requires the bearer token when WEBBRIDGE_TOKEN is set.
 PUBLIC_ENDPOINTS: frozenset[str] = frozenset({"/", "/health", "/version"})
 
+# Extra origins allowed to talk to the bridge via CORS, beyond the
+# chrome-extension:// / moz-extension:// schemes which are always allowed.
+# Set e.g. WEBBRIDGE_EXTRA_ORIGINS="http://localhost:5173,http://localhost:3000"
+# for local dev tooling. Do NOT add plain http(s) web origins in production —
+# this server runs local automation and OS commands.
+_EXTRA_ORIGINS: frozenset[str] = frozenset(
+    o.strip() for o in os.environ.get("WEBBRIDGE_EXTRA_ORIGINS", "").split(",") if o.strip()
+)
+
+
+def _origin_allowed(origin: str) -> bool:
+    """True if *origin* may receive CORS access to this server.
+
+    Extension origins (chrome-extension://..., moz-extension://...) are
+    always allowed since that's the bridge's intended client. Anything else
+    must be explicitly opted in via WEBBRIDGE_EXTRA_ORIGINS — an empty
+    Origin header (non-browser clients, curl, the Python client) is not
+    subject to CORS at all and isn't affected by this check.
+    """
+    if not origin:
+        return False
+    if origin.startswith("chrome-extension://") or origin.startswith("moz-extension://"):
+        return True
+    return origin in _EXTRA_ORIGINS
+
 
 def _default_data_dir() -> str:
     """Return a sensible cross-platform default for the data directory.
@@ -330,8 +355,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
-            # CORS — allow any origin for extension service-worker contexts
-            self.send_header("Access-Control-Allow-Origin", "*")
+            # CORS — reflect the request's Origin ONLY if it's a chrome/moz
+            # extension origin (or explicitly allow-listed). Never "*": this
+            # server executes browser/OS automation commands on localhost,
+            # so a wildcard would let ANY webpage the user visits drive it
+            # via fetch() (DNS-rebinding / CSRF-style attack surface).
+            origin = self.headers.get("Origin", "")
+            if _origin_allowed(origin):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
             self.send_header("Connection", "close")

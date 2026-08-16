@@ -72,6 +72,19 @@ def _get(url, path, timeout=30):
     return resp.status, body
 
 
+def _get_raw(url, path, headers=None, timeout=30):
+    """Like _get but returns (status, response_headers, json_body) and lets
+    the caller pass custom request headers (e.g. Origin)."""
+    host, port = url.split("://")[1].split(":")
+    conn = http.client.HTTPConnection(host, int(port), timeout=timeout)
+    conn.request("GET", path, headers=headers or {})
+    resp = conn.getresponse()
+    body = json.loads(resp.read().decode())
+    result_headers = dict(resp.getheaders())
+    conn.close()
+    return resp.status, result_headers, body
+
+
 def _post(url, path, data=None, timeout=30):
     host, port = url.split("://")[1].split(":")
     conn = http.client.HTTPConnection(host, int(port), timeout=timeout)
@@ -345,6 +358,47 @@ class TestHandlerHealth(unittest.TestCase):
         _with_server(check)
 
 
+class TestHandlerCors(unittest.TestCase):
+    """CORS must not be wide open — this server executes local browser/OS
+    automation commands, so a wildcard Access-Control-Allow-Origin would let
+    any webpage the user has open fetch() it directly."""
+
+    def test_no_origin_header_gets_no_acao(self):
+        def check(b, url):
+            status, headers, body = _get_raw(url, "/health")
+            self.assertEqual(status, 200)
+            self.assertNotIn("Access-Control-Allow-Origin", headers)
+        _with_server(check)
+
+    def test_arbitrary_web_origin_is_rejected(self):
+        def check(b, url):
+            status, headers, body = _get_raw(
+                url, "/health", headers={"Origin": "https://evil.example.com"}
+            )
+            self.assertEqual(status, 200)  # request still succeeds...
+            self.assertNotIn("Access-Control-Allow-Origin", headers)  # ...but browser JS can't read it
+        _with_server(check)
+
+    def test_chrome_extension_origin_is_allowed(self):
+        def check(b, url):
+            ext_origin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+            status, headers, body = _get_raw(
+                url, "/health", headers={"Origin": ext_origin}
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get("Access-Control-Allow-Origin"), ext_origin)
+
+        _with_server(check)
+
+    def test_never_wildcard(self):
+        def check(b, url):
+            _, headers, _ = _get_raw(
+                url, "/health", headers={"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"}
+            )
+            self.assertNotEqual(headers.get("Access-Control-Allow-Origin"), "*")
+        _with_server(check)
+
+
 class TestHandlerCommandsEndpoint(unittest.TestCase):
     def test_commands_returns_list(self):
         def check(b, url):
@@ -528,14 +582,22 @@ class TestHandlerLogEndpoint(unittest.TestCase):
 
 
 class TestHandlerCORSEndpoint(unittest.TestCase):
-    def test_cors_headers_present(self):
+    def test_cors_methods_headers_always_present(self):
+        # Access-Control-Allow-Methods/Headers are safe to always send (they
+        # only matter once ACAO has already allowed the origin), but ACAO
+        # itself is origin-gated — see TestHandlerCors above.
         def check(b, url):
             host, port = url.split("://")[1].split(":")
             conn = http.client.HTTPConnection(host, int(port), timeout=5)
-            conn.request("GET", "/")
+            conn.request("GET", "/", headers={
+                "Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+            })
             resp = conn.getresponse()
             headers = {k.lower(): v for k, v in resp.getheaders()}
-            self.assertEqual(headers.get("access-control-allow-origin"), "*")
+            self.assertEqual(
+                headers.get("access-control-allow-origin"),
+                "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+            )
             self.assertIn("access-control-allow-methods", headers)
             self.assertIn("access-control-allow-headers", headers)
             resp.read()
